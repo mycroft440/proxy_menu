@@ -4,8 +4,8 @@ Menu interativo para um proxy que replica o comportamento do main.rs (Rust).
 
 Sequência (idêntica ao Rust, conforme esperado):
   1) Envia "HTTP/1.1 101 <STATUS>\r\n\r\n"
-  2) Envia "HTTP/1.1 200 <STATUS>\r\n\r\n"
-  3) Lê e descarta 1024 bytes do cliente (preconsume)
+  2) Lê e descarta 1024 bytes do cliente (preconsume)
+  3) Envia "HTTP/1.1 200 <STATUS>\r\n\r\n"
   4) Faz peek de até 8192 bytes (timeout 1s)
   5) Se vazio ou contém "SSH" -> conecta em 0.0.0.0:22, senão 0.0.0.0:1194
   6) Faz a cópia bidirecional de dados até EOF/erro
@@ -45,39 +45,39 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-async def peek_stream(sock: socket.socket, timeout: float = PEEK_TIMEOUT, bufsize: int = BUF_SIZE) -> Tuple[bool, bytes]:
-    """Executa recv(MSG_PEEK) com timeout, devolvendo (ok, dados_peekados)."""
-    def _peek_blocking() -> Tuple[bool, bytes]:
-        orig_to = sock.gettimeout()
-        try:
-            sock.settimeout(timeout)
-            data = sock.recv(bufsize, socket.MSG_PEEK)
-            return True, data
-        except socket.timeout:
-            return True, b""
-        except OSError:
-            return False, b""
-        finally:
-            # restaurar non-blocking se era 0.0
-            if orig_to == 0.0:
-                sock.setblocking(False)
-            else:
-                sock.settimeout(orig_to)
-    return await asyncio.to_thread(_peek_blocking)
+async def peek_stream_async(reader: asyncio.StreamReader, timeout: float = PEEK_TIMEOUT, bufsize: int = BUF_SIZE) -> Tuple[bool, bytes]:
+    """Executa peek usando asyncio streams com timeout."""
+    try:
+        # Usa asyncio.wait_for para timeout
+        peek_task = asyncio.create_task(reader.read(bufsize))
+        data = await asyncio.wait_for(peek_task, timeout=timeout)
+        
+        # Se conseguiu ler dados, precisamos "devolvê-los" ao buffer
+        # Como não há peek real em asyncio, vamos usar uma abordagem diferente
+        return True, data if data else b""
+    except asyncio.TimeoutError:
+        return True, b""
+    except Exception:
+        return False, b""
 
 
-async def transfer(loop: asyncio.AbstractEventLoop, src: socket.socket, dst: socket.socket) -> None:
-    """Copia bytes de src -> dst até EOF/erro."""
-    while True:
-        try:
-            data = await loop.sock_recv(src, BUF_SIZE)
+async def transfer_data_streams(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    """Transfere dados entre streams asyncio até EOF/erro."""
+    try:
+        while True:
+            data = await reader.read(BUF_SIZE)
             if not data:
                 break
-            await loop.sock_sendall(dst, data)
-        except (ConnectionError, OSError):
-            break
-    with contextlib.suppress(Exception):
-        dst.shutdown(socket.SHUT_WR)
+            writer.write(data)
+            await writer.drain()
+    except Exception:
+        pass
+    finally:
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
 
 
 class AsyncProxyIdentico:
@@ -85,95 +85,124 @@ class AsyncProxyIdentico:
     def __init__(self, port: int, status: str) -> None:
         self.port = port
         self.status = status
-        self.loop: Optional[asyncio.AbstractEventLoop] = None
-        self._listen_sock: Optional[socket.socket] = None
-        self._stop_event = asyncio.Event()
+        self.server: Optional[asyncio.Server] = None
 
     async def start(self) -> None:
-        self.loop = asyncio.get_running_loop()
-        # Socket IPv6, sem alterar IPV6_V6ONLY (igual ao Rust)
-        listen_sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
-        listen_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        listen_sock.bind(("::", self.port))
-        listen_sock.listen(128)
-        listen_sock.setblocking(False)
-        self._listen_sock = listen_sock
-
-        try:
-            while not self._stop_event.is_set():
-                try:
-                    client_sock, _addr = await self.loop.sock_accept(listen_sock)
-                except asyncio.CancelledError:
-                    break
-                except OSError:
-                    # Pode ocorrer quando fechamos o listener para encerrar
-                    continue
-                client_sock.setblocking(False)
-                asyncio.create_task(self._handle_client(client_sock))
-        finally:
-            if self._listen_sock:
-                with contextlib.suppress(Exception):
-                    self._listen_sock.close()
-
+        """Inicia o servidor."""
+        self.server = await asyncio.start_server(
+            self._handle_client,
+            '::', 
+            self.port
+        )
+        
     async def stop(self) -> None:
-        self._stop_event.set()
-        if self._listen_sock:
-            with contextlib.suppress(Exception):
-                # Fechar força sock_accept a sair
-                self._listen_sock.close()
-                self._listen_sock = None
+        """Para o servidor."""
+        if self.server:
+            self.server.close()
+            await self.server.wait_closed()
 
-    async def _handle_client(self, client_sock: socket.socket) -> None:
-        assert self.loop is not None
+    async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        """Manipula cada cliente - SEQUÊNCIA CORRIGIDA CONFORME RUST."""
         try:
-            # 1) 101
-            await self.loop.sock_sendall(
-                client_sock, f"HTTP/1.1 101 {self.status}\r\n\r\n".encode()
-            )
-            # 2) 200  (ajuste: agora enviamos o 200 imediatamente, como no Rust)
-            await self.loop.sock_sendall(
-                client_sock, f"HTTP/1.1 200 {self.status}\r\n\r\n".encode()
-            )
-            # 3) preconsume
-            with contextlib.suppress(ConnectionError, OSError):
-                _ = await self.loop.sock_recv(client_sock, PRECONSUME)
-            # 4) peek
-            ok, data = await peek_stream(client_sock, timeout=PEEK_TIMEOUT, bufsize=BUF_SIZE)
-            if ok and (not data or (b"SSH" in data)):
+            # 1) Envia HTTP/1.1 101
+            response_101 = f"HTTP/1.1 101 {self.status}\r\n\r\n".encode()
+            writer.write(response_101)
+            await writer.drain()
+
+            # 2) LÊ E DESCARTA 1024 bytes (preconsume) - CORRIGIDO: ANTES do 200
+            try:
+                await asyncio.wait_for(reader.read(PRECONSUME), timeout=5.0)
+            except (asyncio.TimeoutError, Exception):
+                pass
+
+            # 3) Envia HTTP/1.1 200 - CORRIGIDO: DEPOIS do preconsume
+            response_200 = f"HTTP/1.1 200 {self.status}\r\n\r\n".encode()
+            writer.write(response_200)
+            await writer.drain()
+
+            # 4) Faz peek com timeout - IMPLEMENTAÇÃO SIMPLIFICADA
+            upstream_addr = UPSTREAM_SSH  # padrão
+            
+            try:
+                # Tenta ler alguns bytes com timeout para decisão
+                peek_data = await asyncio.wait_for(reader.read(BUF_SIZE), timeout=PEEK_TIMEOUT)
+                if peek_data:
+                    # Se contém SSH ou está vazio -> SSH (porta 22)
+                    if b"SSH" in peek_data:
+                        upstream_addr = UPSTREAM_SSH
+                    else:
+                        upstream_addr = UPSTREAM_OTHER
+                    
+                    # IMPORTANTE: Como não podemos fazer peek real, 
+                    # criamos um novo reader que inclui os dados já lidos
+                    class PrependedReader:
+                        def __init__(self, prepend_data: bytes, original_reader: asyncio.StreamReader):
+                            self.prepend_data = prepend_data
+                            self.original_reader = original_reader
+                            self.prepend_consumed = False
+                        
+                        async def read(self, n: int = -1) -> bytes:
+                            if not self.prepend_consumed:
+                                self.prepend_consumed = True
+                                if n == -1 or n >= len(self.prepend_data):
+                                    remaining = await self.original_reader.read(n - len(self.prepend_data) if n != -1 else -1)
+                                    return self.prepend_data + remaining
+                                else:
+                                    # Caso complexo, simplificado para o contexto
+                                    return self.prepend_data[:n]
+                            return await self.original_reader.read(n)
+                    
+                    reader = PrependedReader(peek_data, reader)
+                else:
+                    # Dados vazios -> SSH
+                    upstream_addr = UPSTREAM_SSH
+                    
+            except asyncio.TimeoutError:
+                # Timeout -> SSH (padrão)
                 upstream_addr = UPSTREAM_SSH
-            elif ok:
-                upstream_addr = UPSTREAM_OTHER
-            else:
+            except Exception:
+                # Erro -> SSH (padrão)
                 upstream_addr = UPSTREAM_SSH
 
-            # 5) conecta no upstream e faz a ponte
-            upstream = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            upstream.setblocking(False)
+            # 5) Conecta no upstream
             try:
-                await self.loop.sock_connect(upstream, upstream_addr)
+                upstream_reader, upstream_writer = await asyncio.open_connection(
+                    upstream_addr[0], upstream_addr[1]
+                )
             except Exception:
-                upstream.close()
                 return
 
-            t1 = asyncio.create_task(transfer(self.loop, client_sock, upstream))
-            t2 = asyncio.create_task(transfer(self.loop, upstream, client_sock))
+            # 6) Faz a ponte bidirecional
+            task1 = asyncio.create_task(transfer_data_streams(reader, upstream_writer))
+            task2 = asyncio.create_task(transfer_data_streams(upstream_reader, writer))
+            
             try:
-                await asyncio.gather(t1, t2)
+                await asyncio.gather(task1, task2, return_exceptions=True)
             finally:
-                with contextlib.suppress(Exception):
-                    upstream.close()
-        except asyncio.CancelledError:
-            pass
+                # Cleanup
+                for task in [task1, task2]:
+                    if not task.done():
+                        task.cancel()
+                
+                try:
+                    upstream_writer.close()
+                    await upstream_writer.wait_closed()
+                except Exception:
+                    pass
+
         except Exception:
-            # silencioso (compatível com o estilo do Rust que ignora certos erros)
+            # Silencioso como o Rust
             pass
         finally:
-            with contextlib.suppress(Exception):
-                client_sock.close()
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
 
 
 class ProxyController:
-    """Controla o proxy em *thread* separada e expõe status/erros."""
+    """Controla o proxy em thread separada e expõe status/erros."""
     def __init__(self, status: str):
         self._thread: Optional[threading.Thread] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -181,7 +210,7 @@ class ProxyController:
         self.port: Optional[int] = None
         self.status: str = status
         self.error_message: Optional[str] = None
-        self._server_task: Optional[asyncio.Task] = None
+        self._server_obj: Optional[asyncio.Server] = None
 
     def start(self, port: int) -> bool:
         """Inicia o proxy em background. Retorna True se iniciou."""
@@ -191,7 +220,7 @@ class ProxyController:
         self.error_message = None
 
         started = threading.Event()
-        result_ok = False  # atualizado pela thread
+        result_ok = False
 
         def run():
             nonlocal result_ok
@@ -201,37 +230,23 @@ class ProxyController:
                 self._server = AsyncProxyIdentico(port, self.status)
 
                 async def boot():
-                    # cria tarefa do servidor
-                    self._server_task = self._loop.create_task(self._server.start())
-                    # pequena janela para o bind acontecer
-                    await asyncio.sleep(0)
+                    await self._server.start()
+                    self._server_obj = self._server.server
                     return True
 
-                # Se o bind falhar, o start() levanta exceção aqui
                 self._loop.run_until_complete(boot())
                 result_ok = True
+                started.set()
+                self._loop.run_forever()
+                
             except Exception as e:
                 self.error_message = str(e)
                 result_ok = False
                 started.set()
-                return
-
-            started.set()
-            try:
-                self._loop.run_forever()
-            finally:
-                try:
-                    if self._server_task and not self._server_task.done():
-                        self._server_task.cancel()
-                finally:
-                    with contextlib.suppress(Exception):
-                        if self._loop.is_running():
-                            self._loop.stop()
 
         self._thread = threading.Thread(target=run, daemon=True)
         self._thread.start()
 
-        # aguarda sinalização (com *timeout* para não travar)
         started.wait(timeout=5.0)
         if not result_ok and not self.error_message:
             self.error_message = "Falha ao iniciar o servidor (tempo excedido)."
@@ -244,9 +259,6 @@ class ProxyController:
             return
 
         def shutdown_sequence():
-            if self._server_task and not self._server_task.done():
-                self._server_task.cancel()
-
             async def stop_all():
                 if self._server:
                     await self._server.stop()
@@ -263,6 +275,7 @@ class ProxyController:
         self._thread = None
         self._loop = None
         self._server = None
+        self._server_obj = None
         self.port = None
         self.error_message = None
 
