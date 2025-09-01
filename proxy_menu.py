@@ -1,466 +1,470 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Proxy TCP com menu interativo (bonito) em terminal.
+Proxy com menu integrado (replica o fluxo do main.rs):
 
-Recursos:
-- Abrir porta: inicia o proxy escutando em uma porta (dual‑stack IPv6/IPv4).
-- Fechar porta: encerra o proxy e libera a porta.
-- Remover Proxy: desativa o serviço (fecha todas as portas ativas, se houver),
-  remove o próprio arquivo do disco e encerra o programa.
-- Sair: sai do menu mantendo o proxy ativo se ainda houver portas ativas.
+Fluxo por conexão (mesmo do Rust):
+  1) Envia "HTTP/1.1 101 <status>\r\n\r\n"
+  2) Lê/descarta 1024 bytes do cliente (sem timeout)
+  3) Envia "HTTP/1.1 200 <status>\r\n\r\n"
+  4) Faz peek (até 1s). Se não houver dados OU contiver b"SSH", roteia para SSH; senão, OVPN.
+  5) Conecta ao destino e faz piping bidirecional.
 
-Notas de implementação:
-- Usa asyncio em um thread dedicado para o servidor, enquanto o menu roda na thread principal. As operações de abrir/fechar são despachadas com run_coroutine_threadsafe para o event loop do servidor.
-- O handshake imita o comportamento descrito: envia "HTTP/1.1 101 <status>", espia dados por até ~1s (MSG_PEEK) para decidir destino, depois envia "HTTP/1.1 200 <status>" e inicia o túnel bidirecional.
-- Decisão de destino: se "SSH" está nos bytes iniciais (ou nenhum dado) -> 0.0.0.0:22, senão -> 0.0.0.0:1194.
+Requisitos: Python 3.9+ (usa asyncio.to_thread).
+Obs: escutar em portas <1024 requer privilégios elevados em Unix (sudo).
 """
 
 import asyncio
+import contextlib
 import socket
 import threading
-import time
-from typing import Optional, Tuple, List
-from concurrent.futures import Future
+from dataclasses import dataclass
+from typing import List, Tuple, Optional
 
-# ============================ Núcleo do Proxy ============================
-BUF_SIZE = 8192
+# ------------------------
+# Configuração
+# ------------------------
 
+@dataclass
+class ProxyConfig:
+    listen_port: int = 80
+    status_banner: str = "@RustyManager"
+    ssh_host: str = "127.0.0.1"
+    ssh_port: int = 22
+    ovpn_host: str = "127.0.0.1"
+    ovpn_port: int = 1194
+    backlog: int = 128
+    dual_stack: bool = True           # Tentar IPv6 com V6ONLY=0 (aceita IPv4 também)
+    buf_size: int = 8192
+    sniff_timeout: float = 1.0        # timeout do peek em segundos
+    preconsume: int = 1024            # bytes lidos/descartados logo após o 101
 
-async def transfer_data(loop: asyncio.AbstractEventLoop, src: socket.socket, dst: socket.socket) -> None:
-    """Copia bytes de src -> dst até EOF."""
-    src.setblocking(False)
-    dst.setblocking(False)
-    try:
-        while True:
-            data = await loop.sock_recv(src, BUF_SIZE)
-            if not data:
-                break
-            await loop.sock_sendall(dst, data)
-    except (ConnectionError, OSError):
-        pass
+# ------------------------
+# Servidor assíncrono
+# ------------------------
 
-
-async def bidirectional_proxy(loop: asyncio.AbstractEventLoop, a: socket.socket, b: socket.socket) -> None:
-    """Encaminha dados nos dois sentidos até uma das metades fechar."""
-    await asyncio.gather(
-        transfer_data(loop, a, b),
-        transfer_data(loop, b, a),
-        return_exceptions=True
-    )
-    try:
-        a.shutdown(socket.SHUT_RDWR)
-    except OSError:
-        pass
-    try:
-        b.shutdown(socket.SHUT_RDWR)
-    except OSError:
-        pass
-    a.close()
-    b.close()
-
-
-async def peek_stream(sock: socket.socket, timeout: float = 1.0) -> Tuple[bool, bytes]:
-    """
-    Espia bytes disponíveis (sem consumir) por até 'timeout' segundos.
-    Retorna (ok, dados).
-    """
-    sock.setblocking(False)
-    start = time.time()
-    last_err = None
-    while (time.time() - start) < timeout:
-        try:
-            data = sock.recv(1024, socket.MSG_PEEK)
-            return True, data
-        except (BlockingIOError, InterruptedError) as e:
-            last_err = e
-            await asyncio.sleep(0.05)
-        except OSError as e:
-            last_err = e
-            break
-    return False, b''
-
-
-async def handle_client(loop: asyncio.AbstractEventLoop, client_sock: socket.socket, status_banner: str) -> None:
-    """Atende um cliente: handshake 101/200, detecção de destino e túnel."""
-    client_sock.setblocking(False)
-    # 101
-    try:
-        await loop.sock_sendall(client_sock, f"HTTP/1.1 101 {status_banner}\r\n\r\n".encode())
-    except (ConnectionError, OSError):
-        client_sock.close()
-        return
-
-    ok, data = await peek_stream(client_sock, timeout=1.0)
-
-    if ok and (not data or b"SSH" in data.upper()):
-        upstream_host, upstream_port = "0.0.0.0", 22
-    elif ok:
-        upstream_host, upstream_port = "0.0.0.0", 1194
-    else:
-        upstream_host, upstream_port = "0.0.0.0", 22  # fallback
-
-    # Conecta no servidor de destino
-    upstream = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    upstream.setblocking(False)
-    try:
-        await loop.sock_connect(upstream, (upstream_host, upstream_port))
-    except (ConnectionError, OSError):
-        upstream.close()
-        client_sock.close()
-        return
-
-    # 200
-    try:
-        await loop.sock_sendall(client_sock, f"HTTP/1.1 200 {status_banner}\r\n\r\n".encode())
-    except (ConnectionError, OSError):
-        upstream.close()
-        client_sock.close()
-        return
-
-    # Começa o túnel
-    await bidirectional_proxy(loop, client_sock, upstream)
-
-
-class ProxyServer:
-    """
-    Controla socket de escuta dual-stack e laço de accept.
-    """
-
-    def __init__(self, loop: asyncio.AbstractEventLoop, status_banner: str = "@RustyManager"):
-        self.loop = loop
-        self.status_banner = status_banner
-        self.listen_sock: Optional[socket.socket] = None
-        self.listen_port: Optional[int] = None
-        self.accept_task: Optional[asyncio.Task] = None
-        self._stop_evt = asyncio.Event()
-
-    async def open(self, port: int) -> None:
-        if self.accept_task and not self.accept_task.done():
-            # já ativo em outra porta -> fecha antes
-            await self.close()
-
-        # Socket IPv6 dual-stack (quando suportado)
-        s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
-        try:
-            s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
-        except OSError:
-            # Sistemas que não suportam desabilitar V6ONLY
-            pass
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.bind(("::", port))
-        s.listen(200)
-        s.setblocking(False)
-
-        self.listen_sock = s
-        self.listen_port = port
-        self._stop_evt = asyncio.Event()
-
-        async def accept_loop():
-            while not self._stop_evt.is_set():
-                try:
-                    client, _addr = await self.loop.sock_accept(self.listen_sock)
-                except (OSError, ConnectionError):
-                    if self._stop_evt.is_set():
-                        break
-                    await asyncio.sleep(0.05)
-                    continue
-                # cria tarefa para o cliente
-                self.loop.create_task(handle_client(self.loop, client, self.status_banner))
-            # fechar o socket quando sair
-            if self.listen_sock:
-                try:
-                    self.listen_sock.close()
-                except OSError:
-                    pass
-
-        self.accept_task = self.loop.create_task(accept_loop())
-
-    async def close(self) -> None:
-        # encerra accept loop e fecha socket
-        self._stop_evt.set()
-        if self.listen_sock:
-            try:
-                self.listen_sock.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-            try:
-                self.listen_sock.close()
-            except OSError:
-                pass
-            self.listen_sock = None
-        if self.accept_task:
-            try:
-                await asyncio.wait_for(self.accept_task, timeout=1.5)
-            except asyncio.TimeoutError:
-                self.accept_task.cancel()
-        self.listen_port = None
-
-    def is_active(self) -> bool:
-        return (
-            self.listen_sock is not None
-            and self.listen_port is not None
-            and self.accept_task
-            and not self.accept_task.done()
-        )
-
-
-# =========================== Controller em Thread ===========================
-class ProxyController:
-    """
-    Executa o event loop do servidor em background e expõe métodos thread‑safe.
-
-    Nesta versão, a thread de servidor não é marcada como daemon para que,
-    se o menu for encerrado com o proxy ativo, a aplicação continue
-    executando e mantendo o socket de escuta aberto. O menu em si termina,
-    mas a thread do servidor permanece em execução.
-    """
-
-    def __init__(self, status_banner: str = "@RustyManager"):
-        # Cria a thread do event loop. Não usamos daemon=True para que o servidor
-        # continue rodando mesmo após a finalização do menu interativo.
-        self.thread = threading.Thread(target=self._thread_main, daemon=False)
-        self.loop_ready = threading.Event()
+class AsyncProxyServer:
+    def __init__(self, cfg: ProxyConfig) -> None:
+        self.cfg = cfg
         self.loop: Optional[asyncio.AbstractEventLoop] = None
-        self.server: Optional[ProxyServer] = None
-        self.status_banner = status_banner
-        self.thread.start()
-        self.loop_ready.wait()
+        self._stopping = asyncio.Event()
+        self._socks: List[socket.socket] = []
+        self._accept_tasks: List[asyncio.Task] = []
+        self._client_tasks: set[asyncio.Task] = set()
 
-    def _thread_main(self):
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        self.loop = loop
-        self.server = ProxyServer(loop, status_banner=self.status_banner)
-        self.loop_ready.set()
-        try:
-            loop.run_forever()
-        finally:
-            loop.stop()
-            loop.close()
+    async def start(self) -> None:
+        """Inicializa sockets de escuta e começa os loops de accept."""
+        self.loop = asyncio.get_running_loop()
+        self._stopping.clear()
+        self._socks = []
 
-    def _submit(self, coro) -> Future:
-        if not self.loop:
-            raise RuntimeError("Event loop não inicializado")
-        return asyncio.run_coroutine_threadsafe(coro, self.loop)
+        # Tenta IPv6 com dual-stack, e faz fallback para IPv4 se necessário
+        errors = []
 
-    def abrir_porta(self, port: int) -> None:
-        fut = self._submit(self.server.open(port))
-        fut.result()
-
-    def fechar_porta(self) -> None:
-        fut = self._submit(self.server.close())
-        fut.result()
-
-    def ativo(self) -> bool:
-        return self.server.is_active() if self.server else False
-
-    def porta(self) -> Optional[int]:
-        return self.server.listen_port if self.server else None
-
-
-# ================================ CLI Bonita ================================
-# Códigos ANSI para formatação de cor e estilo
-RESET = "\033[0m"
-BOLD = "\033[1m"
-DIM = "\033[2m"
-GREEN = "\033[32m"
-RED = "\033[31m"
-CYAN = "\033[36m"
-YELL = "\033[33m"
-
-# Função para limpar a tela e reposicionar o cursor no canto superior esquerdo.
-# Esta função é usada para garantir que o cabeçalho (status) esteja sempre visível
-# no topo da tela a cada iteração do menu.
-def clear():
-    # Sequência ANSI: \033[2J limpa a tela, \033[H move o cursor para (1,1)
-    print("\033[2J\033[H", end="")
-
-
-def banner_status(ctrl: ProxyController) -> str:
-    if ctrl.ativo():
-        return f"{GREEN}ATIVO{RESET} na porta {BOLD}{ctrl.porta()}{RESET}"
-    return f"{RED}INATIVO{RESET}"
-
-
-def print_header(ctrl: ProxyController):
-    """
-    Exibe o cabeçalho do menu, incluindo o status atual do proxy. Sempre
-    limpa a tela antes de imprimir para manter o status visível e
-    atualizado conforme mudanças de porta e estado.
-    """
-    clear()
-    # Linha de título e descrição
-    print(BOLD + "Rusty Proxy (Python)" + RESET + "  •  " + DIM + "Dual-stack IPv6/IPv4" + RESET)
-    # Linha de status
-    print("Status: " + banner_status(ctrl))
-    # Linha divisória
-    print("-" * 60)
-
-
-def input_int(prompt: str, minimo: int = 1, maximo: int = 65535) -> Optional[int]:
-    try:
-        v = int(input(prompt).strip())
-        if v < minimo or v > maximo:
-            print(f"{RED}Porta inválida (1-65535).{RESET}")
-            return None
-        return v
-    except ValueError:
-        print(f"{RED}Digite um número válido.{RESET}")
-        return None
-
-
-def remover_proxy(ctrl: ProxyController) -> None:
-    """
-    Desativa o proxy em todas as portas (se estiver ativo), remove o arquivo
-    atual do disco e encerra o programa. Este método é chamado pela opção
-    "Remover Proxy" do menu principal.
-    """
-    import os
-    import sys
-    from pathlib import Path
-    # Imprime cabeçalho atualizado
-    print_header(ctrl)
-    # Tenta fechar a porta ativa, se houver
-    try:
-        if ctrl.ativo():
-            ctrl.fechar_porta()
-            print_header(ctrl)
-            print(f"{GREEN}Proxy desativado com sucesso.{RESET}")
-    except Exception as e:
-        print_header(ctrl)
-        print(f"{YELL}Aviso ao desativar proxy: {e}{RESET}")
-
-    # Tenta parar o loop de eventos para encerrar a thread do servidor
-    try:
-        # Envia um sinal para parar o loop se estiver rodando
-        if getattr(ctrl, 'loop', None):
-            ctrl.loop.call_soon_threadsafe(ctrl.loop.stop)
-    except Exception:
-        pass
-    # Remove o próprio arquivo
-    try:
-        me = Path(__file__).resolve()
-        # Garante que o arquivo exista antes de remover
-        if me.exists():
-            me.unlink()
-            print(f"{GREEN}Arquivo removido: {me}{RESET}")
-    except Exception as e:
-        print(f"{RED}Falha ao remover arquivo: {e}{RESET}")
-    # Encerra o processo
-    sys.exit(0)
-
-
-def menu_principal(ctrl: ProxyController):
-    """
-    Loop principal de interação. O status do proxy é exibido de forma
-    permanente no cabeçalho. Permite abrir/fechar porta, atualizar
-    manualmente o status e sair a qualquer momento sem encerrar o servidor.
-    """
-    while True:
-        # imprime cabeçalho com status dinâmico
-        print_header(ctrl)
-        # opções do menu
-        print(f"{BOLD}1){RESET} Abrir porta")
-        print(f"{BOLD}2){RESET} Fechar porta")
-        print(f"{BOLD}3){RESET} Remover Proxy")
-        print(f"{BOLD}0){RESET} Sair (o proxy continua ativo se estiver ATIVO)")
-        op = input(f"\n{CYAN}Selecione uma opção:{RESET} ").strip()
-        if op == "1":
-            # Abrir porta
-            porta = None
-            while porta is None:
-                print_header(ctrl)
-                porta = input_int("Informe a porta para escutar: ")
+        if self.cfg.dual_stack:
             try:
-                ctrl.abrir_porta(porta)
-                print_header(ctrl)
-                print(f"{GREEN}Proxy iniciado na porta {porta}.{RESET}")
-            except Exception as e:
-                print_header(ctrl)
-                print(f"{RED}Falha ao abrir porta: {e}{RESET}")
-            input(DIM + "\nPressione Enter para continuar..." + RESET)
-        elif op == "2":
-            # Fechar porta
-            print_header(ctrl)
-            if not ctrl.ativo():
-                print(f"{YELL}Proxy já está inativo.{RESET}")
+                s6 = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+                s6.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                with contextlib.suppress(OSError, AttributeError):
+                    s6.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+                s6.bind(("::", self.cfg.listen_port))
+                s6.listen(self.cfg.backlog)
+                s6.setblocking(False)
+                self._socks.append(s6)
+                print(f"[LISTEN] IPv6 dual-stack em [::]:{self.cfg.listen_port}")
+            except OSError as e:
+                errors.append(("IPv6 dual-stack", e))
+
+        # Se não conseguimos dual-stack, tenta sockets separados
+        if not self._socks:
+            # IPv6 only
+            try:
+                s6 = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+                s6.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                with contextlib.suppress(OSError, AttributeError):
+                    s6.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                s6.bind(("::", self.cfg.listen_port))
+                s6.listen(self.cfg.backlog)
+                s6.setblocking(False)
+                self._socks.append(s6)
+                print(f"[LISTEN] IPv6 em [::]:{self.cfg.listen_port}")
+            except OSError as e:
+                errors.append(("IPv6 only", e))
+
+            # IPv4
+            try:
+                s4 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s4.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s4.bind(("0.0.0.0", self.cfg.listen_port))
+                s4.listen(self.cfg.backlog)
+                s4.setblocking(False)
+                self._socks.append(s4)
+                print(f"[LISTEN] IPv4 em 0.0.0.0:{self.cfg.listen_port}")
+            except OSError as e:
+                errors.append(("IPv4", e))
+
+        if not self._socks:
+            print("[ERRO] Falha ao abrir portas:")
+            for where, err in errors:
+                print(f"  - {where}: {err}")
+            raise RuntimeError("Não foi possível iniciar o listener.")
+
+        # Cria tarefas de accept
+        self._accept_tasks = [asyncio.create_task(self._accept_loop(s)) for s in self._socks]
+
+    async def shutdown(self) -> None:
+        """Para de aceitar e encerra todas as conexões ativas."""
+        self._stopping.set()
+
+        # Fecha listeners
+        for s in self._socks:
+            with contextlib.suppress(Exception):
+                s.close()
+        self._socks.clear()
+
+        # Cancela loops de accept
+        for t in self._accept_tasks:
+            t.cancel()
+        with contextlib.suppress(Exception):
+            await asyncio.gather(*self._accept_tasks, return_exceptions=True)
+        self._accept_tasks.clear()
+
+        # Cancela conexões de clientes
+        if self._client_tasks:
+            for t in list(self._client_tasks):
+                t.cancel()
+            with contextlib.suppress(Exception):
+                await asyncio.gather(*self._client_tasks, return_exceptions=True)
+        self._client_tasks.clear()
+
+        print("[OK] Servidor parado.")
+
+    async def _accept_loop(self, listen_sock: socket.socket) -> None:
+        """Loop de accept por socket."""
+        assert self.loop is not None
+        while not self._stopping.is_set():
+            try:
+                client_sock, addr = await self.loop.sock_accept(listen_sock)
+            except asyncio.CancelledError:
+                break
+            except OSError:
+                if self._stopping.is_set():
+                    break
+                continue
+
+            client_sock.setblocking(False)
+            task = asyncio.create_task(self._handle_client(client_sock, addr))
+            self._client_tasks.add(task)
+            task.add_done_callback(self._client_tasks.discard)
+
+    async def _handle_client(self, client_sock: socket.socket, addr) -> None:
+        """Fluxo por cliente: 101 -> (read 1024) -> 200 -> peek -> decide -> conecta -> túnel."""
+        assert self.loop is not None
+        cfg = self.cfg
+        try:
+            # 1) 101
+            await self.loop.sock_sendall(
+                client_sock, f"HTTP/1.1 101 {cfg.status_banner}\r\n\r\n".encode()
+            )
+
+            # 2) Lê/descarta 1024 bytes (sem timeout), imitando o main.rs
+            with contextlib.suppress(ConnectionError, OSError):
+                _ = await self.loop.sock_recv(client_sock, cfg.preconsume)
+
+            # 3) 200
+            await self.loop.sock_sendall(
+                client_sock, f"HTTP/1.1 200 {cfg.status_banner}\r\n\r\n".encode()
+            )
+
+            # 4) Peek com timeout (até cfg.buf_size)
+            ok, data = await self._peek_stream(client_sock, cfg.sniff_timeout, cfg.buf_size)
+
+            # 5) Heurística do Rust:
+            #    - Sem dados no peek OU contém b"SSH" -> SSH
+            #    - Caso contrário -> OVPN
+            if ok and (not data or (b"SSH" in data)):
+                upstream_host, upstream_port = cfg.ssh_host, cfg.ssh_port
+                dest_name = f"{upstream_host}:{upstream_port} (SSH)"
+            elif ok:
+                upstream_host, upstream_port = cfg.ovpn_host, cfg.ovpn_port
+                dest_name = f"{upstream_host}:{upstream_port} (OVPN)"
             else:
+                upstream_host, upstream_port = cfg.ssh_host, cfg.ssh_port
+                dest_name = f"{upstream_host}:{upstream_port} (SSH, fallback)"
+
+            # Conecta no upstream
+            upstream = await self._connect_upstream(upstream_host, upstream_port)
+            print(f"[ROUTE] {addr} -> {dest_name}")
+
+            # Túnel bidirecional
+            await self._bidirectional_proxy(client_sock, upstream)
+
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            # Silencioso, para não poluir — pode logar se desejar
+            # print(f"[ERRO] Conexão {addr}: {e}")
+            pass
+        finally:
+            with contextlib.suppress(Exception):
+                client_sock.close()
+
+    async def _peek_stream(self, sock: socket.socket, timeout: float, buf_size: int) -> Tuple[bool, bytes]:
+        """Executa recv(MSG_PEEK) com timeout em thread separada (portável)."""
+        def _peek_blocking() -> Tuple[bool, bytes]:
+            try:
+                sock.settimeout(timeout)
                 try:
-                    ctrl.fechar_porta()
-                    print_header(ctrl)
-                    print(f"{GREEN}Proxy encerrado com sucesso.{RESET}")
+                    data = sock.recv(buf_size, socket.MSG_PEEK)
+                finally:
+                    sock.settimeout(None)
+                return True, data
+            except socket.timeout:
+                return True, b""
+            except OSError:
+                return False, b""
+
+        return await asyncio.to_thread(_peek_blocking)
+
+    async def _connect_upstream(self, host: str, port: int) -> socket.socket:
+        """Cria socket para host/port e conecta de forma não-bloqueante."""
+        assert self.loop is not None
+        family = socket.AF_INET6 if ":" in host else socket.AF_INET
+        s = socket.socket(family, socket.SOCK_STREAM)
+        s.setblocking(False)
+        try:
+            await self.loop.sock_connect(s, (host, port))
+            return s
+        except Exception:
+            with contextlib.suppress(Exception):
+                s.close()
+            raise
+
+    async def _transfer(self, src: socket.socket, dst: socket.socket) -> None:
+        """Copia bytes de src para dst até EOF/erro; fecha metade de escrita ao término."""
+        assert self.loop is not None
+        while True:
+            try:
+                data = await self.loop.sock_recv(src, self.cfg.buf_size)
+                if not data:
+                    break
+                await self.loop.sock_sendall(dst, data)
+            except (ConnectionError, OSError):
+                break
+        with contextlib.suppress(Exception):
+            dst.shutdown(socket.SHUT_WR)
+
+    async def _bidirectional_proxy(self, a: socket.socket, b: socket.socket) -> None:
+        """Transfere dados nos dois sentidos e fecha ambos ao final."""
+        t1 = asyncio.create_task(self._transfer(a, b))
+        t2 = asyncio.create_task(self._transfer(b, a))
+        try:
+            await asyncio.gather(t1, t2)
+        finally:
+            with contextlib.suppress(Exception):
+                a.close()
+            with contextlib.suppress(Exception):
+                b.close()
+
+
+# ------------------------
+# Controle em thread (para o menu ficar responsivo)
+# ------------------------
+
+class ServerController:
+    """Executa o loop asyncio numa thread separada para manter o menu interativo."""
+    def __init__(self, cfg: ProxyConfig) -> None:
+        self.cfg = cfg
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._thread: Optional[threading.Thread] = None
+        self._server: Optional[AsyncProxyServer] = None
+        self._started = threading.Event()
+
+    def start(self) -> None:
+        if self.is_running():
+            print("[AVISO] Servidor já está em execução.")
+            return
+
+        def runner():
+            self._loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self._loop)
+            self._server = AsyncProxyServer(self.cfg)
+
+            async def _boot():
+                try:
+                    await self._server.start()
+                    print(f"[OK] Servidor iniciado na porta {self.cfg.listen_port}.")
+                    self._started.set()
                 except Exception as e:
-                    print_header(ctrl)
-                    print(f"{RED}Falha ao fechar: {e}{RESET}")
-            input(DIM + "\nPressione Enter para continuar..." + RESET)
-        elif op == "3":
-            # Desativa o proxy, remove o arquivo e encerra
-            remover_proxy(ctrl)
-        elif op == "0":
-            # Sair sem encerrar o servidor se estiver ativo
-            print_header(ctrl)
-            if ctrl.ativo():
-                print(f"{YELL}Saindo do menu, mas o proxy permanecerá {banner_status(ctrl)}.{RESET}")
-            else:
-                print(f"{DIM}Encerrando menu.{RESET}")
+                    print(f"[ERRO] Falha ao iniciar servidor: {e}")
+                    self._started.set()  # permite continuar o menu mesmo em erro
+
+            self._loop.create_task(_boot())
+            try:
+                self._loop.run_forever()
+            finally:
+                # limpeza de tarefas pendentes
+                pending = asyncio.all_tasks(loop=self._loop)
+                for t in pending:
+                    t.cancel()
+                with contextlib.suppress(Exception):
+                    self._loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                self._loop.close()
+
+        self._thread = threading.Thread(target=runner, name="proxy-server", daemon=True)
+        self._thread.start()
+        # Espera até subir (ou falhar)
+        self._started.wait(timeout=5)
+
+    def stop(self) -> None:
+        if not self.is_running():
+            print("[AVISO] Servidor não está em execução.")
+            return
+
+        assert self._loop is not None and self._server is not None
+
+        def _stopper():
+            async def _inner():
+                await self._server.shutdown()
+                self._loop.stop()
+            asyncio.create_task(_inner())
+
+        self._loop.call_soon_threadsafe(_stopper)
+        if self._thread:
+            self._thread.join(timeout=5)
+        self._thread = None
+        self._loop = None
+        self._server = None
+        self._started.clear()
+
+    def is_running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+
+# ------------------------
+# Menu de texto
+# ------------------------
+
+def print_config(cfg: ProxyConfig) -> None:
+    print("\n=== Configuração Atual ===")
+    print(f" Porta de escuta     : {cfg.listen_port}")
+    print(f" Status banner       : {cfg.status_banner}")
+    print(f" Destino SSH         : {cfg.ssh_host}:{cfg.ssh_port}")
+    print(f" Destino OVPN        : {cfg.ovpn_host}:{cfg.ovpn_port}")
+    print(f" Dual-stack IPv6/IPv4: {'sim' if cfg.dual_stack else 'não'}")
+    print(f" Pre-consumo (bytes) : {cfg.preconsume}")
+    print(f" Peek timeout (s)    : {cfg.sniff_timeout}")
+    print("==========================\n")
+
+def ask_int(prompt: str, default: int, min_v: int = 1, max_v: int = 65535) -> int:
+    val = input(f"{prompt} [{default}]: ").strip()
+    if not val:
+        return default
+    try:
+        n = int(val)
+        if not (min_v <= n <= max_v):
+            raise ValueError
+        return n
+    except ValueError:
+        print("[ERRO] Valor inválido. Mantendo o padrão.")
+        return default
+
+def ask_str(prompt: str, default: str) -> str:
+    val = input(f"{prompt} [{default}]: ").strip()
+    return val if val else default
+
+def ask_host_port(prompt: str, default_host: str, default_port: int) -> Tuple[str, int]:
+    raw = input(f"{prompt} [{default_host}:{default_port}]: ").strip()
+    if not raw:
+        return default_host, default_port
+    if raw.count(":") == 0:
+        # Sem porta
+        return raw, default_port
+    # IPv6 com colchetes: [::1]:22
+    if raw.startswith("["):
+        try:
+            host, p = raw.split("]")
+            host = host.strip("[]")
+            port = int(p.strip(":"))
+            return host, port
+        except Exception:
+            print("[ERRO] Formato inválido. Mantendo padrão.")
+            return default_host, default_port
+    # IPv4/hostname:porta
+    try:
+        host, p = raw.rsplit(":", 1)
+        port = int(p)
+        return host, port
+    except Exception:
+        print("[ERRO] Formato inválido. Mantendo padrão.")
+        return default_host, default_port
+
+def run_menu() -> None:
+    cfg = ProxyConfig()
+    ctrl = ServerController(cfg)
+
+    while True:
+        print_config(cfg)
+        print("1) Iniciar servidor")
+        print("2) Parar servidor")
+        print("3) Alterar porta de escuta")
+        print("4) Alterar status banner")
+        print("5) Alterar destino SSH (host:porta)")
+        print("6) Alterar destino OVPN (host:porta)")
+        print("7) Alternar dual-stack IPv6/IPv4")
+        print("8) Ajustar pre-consumo (bytes)")
+        print("9) Ajustar timeout do peek (segundos)")
+        print("0) Sair")
+        choice = input("Escolha: ").strip()
+
+        if choice == "1":
+            ctrl.start()
+        elif choice == "2":
+            ctrl.stop()
+        elif choice == "3":
+            cfg.listen_port = ask_int("Nova porta", cfg.listen_port)
+            if ctrl.is_running():
+                print("[INFO] Reinicie o servidor para aplicar.")
+        elif choice == "4":
+            cfg.status_banner = ask_str("Novo status", cfg.status_banner)
+            if ctrl.is_running():
+                print("[INFO] Reinicie o servidor para aplicar.")
+        elif choice == "5":
+            cfg.ssh_host, cfg.ssh_port = ask_host_port("Novo destino SSH", cfg.ssh_host, cfg.ssh_port)
+            if ctrl.is_running():
+                print("[INFO] Reinicie o servidor para aplicar.")
+        elif choice == "6":
+            cfg.ovpn_host, cfg.ovpn_port = ask_host_port("Novo destino OVPN", cfg.ovpn_host, cfg.ovpn_port)
+            if ctrl.is_running():
+                print("[INFO] Reinicie o servidor para aplicar.")
+        elif choice == "7":
+            cfg.dual_stack = not cfg.dual_stack
+            print(f"[OK] Dual-stack agora está {'ativado' if cfg.dual_stack else 'desativado'}.")
+            if ctrl.is_running():
+                print("[INFO] Reinicie o servidor para aplicar.")
+        elif choice == "8":
+            cfg.preconsume = ask_int("Bytes a descartar após 101", cfg.preconsume, 0, 65536)
+            if ctrl.is_running():
+                print("[INFO] Reinicie o servidor para aplicar.")
+        elif choice == "9":
+            # aceita float simples
+            val = ask_str("Timeout do peek (s)", f"{cfg.sniff_timeout}")
+            try:
+                cfg.sniff_timeout = max(0.0, float(val))
+            except ValueError:
+                print("[ERRO] Valor inválido. Mantendo.")
+            if ctrl.is_running():
+                print("[INFO] Reinicie o servidor para aplicar.")
+        elif choice == "0":
+            if ctrl.is_running():
+                ctrl.stop()
+            print("Saindo...")
             break
         else:
-            print_header(ctrl)
-            print(f"{RED}Opção inválida.{RESET}")
-            time.sleep(0.8)
-
-
-def submenu_porta(ctrl: ProxyController):
-    while True:
-        print_header(ctrl)
-        print(f"{BOLD}1){RESET} Abrir porta")
-        print(f"{BOLD}2){RESET} Fechar porta")
-        print(f"{BOLD}9){RESET} Voltar")
-        op = input(f"\n{CYAN}Selecione uma opção:{RESET} ").strip()
-        if op == "1":
-            porta = None
-            while porta is None:
-                porta = input_int("Informe a porta para escutar: ")
-            try:
-                ctrl.abrir_porta(porta)
-                print(f"{GREEN}Proxy iniciado na porta {porta}.{RESET}")
-            except Exception as e:
-                print(f"{RED}Falha ao abrir porta: {e}{RESET}")
-            time.sleep(0.8)
-        elif op == "2":
-            if not ctrl.ativo():
-                print(f"{YELL}Proxy já está inativo.{RESET}")
-            else:
-                try:
-                    ctrl.fechar_porta()
-                    print(f"{GREEN}Proxy encerrado com sucesso.{RESET}")
-                except Exception as e:
-                    print(f"{RED}Falha ao fechar: {e}{RESET}")
-            time.sleep(0.8)
-        elif op == "9":
-            return
-        else:
-            print(f"{RED}Opção inválida.{RESET}")
-
-
-def main():
-    """
-    Ponto de entrada do script. Inicializa o controlador e inicia o menu.
-    Após sair do menu, não encerra o servidor automaticamente; se o proxy
-    estiver ativo, ele continuará rodando em background. Para encerrar
-    completamente, execute o programa novamente e escolha a opção de
-    "Fechar porta" ou encerre o processo manualmente.
-    """
-    ctrl = ProxyController(status_banner="@RustyManager")
-    menu_principal(ctrl)
-    # Não finalizamos o proxy automaticamente ao sair. O usuário pode
-    # encerrar a porta posteriormente, se desejar.
-    if ctrl.ativo():
-        print(f"{YELL}Proxy permanece ativo na porta {ctrl.porta()}.{RESET}")
-    else:
-        print(f"{DIM}Nenhuma porta ativa. Programa encerrado.{RESET}")
-
+            print("[ERRO] Opção inválida.")
 
 if __name__ == "__main__":
-    main()
+    try:
+        run_menu()
+    except KeyboardInterrupt:
+        print("\nEncerrado pelo usuário.")
