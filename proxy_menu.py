@@ -1,11 +1,34 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+Proxy com menu e múltiplas portas:
+ - Fluxo por conexão (compatível com main.rs):
+   1) "HTTP/1.1 101 <status>\r\n\r\n"
+   2) consome 1024 bytes do cliente (sem timeout)
+   3) "HTTP/1.1 200 <status>\r\n\r\n"
+   4) peek (1s); sem dados ou contém b"SSH" => SSH, senão => OVPN
+   5) túnel bidirecional
+ - Menu:
+   1) Abrir porta
+   2) Fechar porta
+   3) Desativar todas as portas e remover COMPLETAMENTE este arquivo
+   0) Sair
+ - Status no topo:
+   "status: ativo p.: 80, 8080"   ou   "status: Inativo"
+
+Observação: portas <1024 exigem privilégios em Unix (sudo).
+"""
+
 import asyncio
 import contextlib
+import os
 import socket
+import subprocess
+import sys
+import tempfile
 import threading
 from dataclasses import dataclass
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Dict
 
 # =========================
 # Configuração padrão
@@ -25,7 +48,7 @@ class ProxyConfig:
     preconsume: int = 1024           # bytes descartados logo após o 101
 
 # =========================
-# Servidor assíncrono
+# Servidor assíncrono (1 porta)
 # =========================
 class AsyncProxyServer:
     def __init__(self, cfg: ProxyConfig) -> None:
@@ -162,18 +185,26 @@ class AsyncProxyServer:
                 client_sock.close()
 
     async def _peek_stream(self, sock: socket.socket, timeout: float, buf_size: int) -> Tuple[bool, bytes]:
+        """
+        Faz recv(MSG_PEEK) com timeout em thread. Restaura o modo original do socket
+        (fundamental para manter non-blocking no asyncio).
+        """
         def _peek_blocking() -> Tuple[bool, bytes]:
+            orig_to = sock.gettimeout()  # 0.0 => non-blocking; None => blocking; >0 => blocking com timeout
             try:
-                sock.settimeout(timeout)
-                try:
-                    data = sock.recv(buf_size, socket.MSG_PEEK)
-                finally:
-                    sock.settimeout(None)
+                sock.settimeout(timeout)   # bloqueante com timeout
+                data = sock.recv(buf_size, socket.MSG_PEEK)
                 return True, data
             except socket.timeout:
                 return True, b""
             except OSError:
                 return False, b""
+            finally:
+                # Restaura exatamente o estado original
+                if orig_to == 0.0:
+                    sock.setblocking(False)
+                else:
+                    sock.settimeout(orig_to)
         return await asyncio.to_thread(_peek_blocking)
 
     async def _connect_upstream(self, host: str, port: int) -> socket.socket:
@@ -182,6 +213,11 @@ class AsyncProxyServer:
         s = socket.socket(family, socket.SOCK_STREAM)
         s.setblocking(False)
         try:
+            # Opcional: latência/keepalive
+            with contextlib.suppress(OSError):
+                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            with contextlib.suppress(OSError):
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
             await self.loop.sock_connect(s, (host, port))
             return s
         except Exception:
@@ -214,7 +250,7 @@ class AsyncProxyServer:
                 b.close()
 
 # =========================
-# Controlador em thread
+# Controlador (1 porta) em thread
 # =========================
 class ServerController:
     def __init__(self, cfg: ProxyConfig) -> None:
@@ -235,14 +271,14 @@ class ServerController:
             self._server = AsyncProxyServer(self.cfg)
 
             async def _boot():
-                nonlocal_running_ok = False
+                ok = False
                 try:
                     await self._server.start()
-                    nonlocal_running_ok = True
+                    ok = True
                 except Exception as e:
-                    print(f"[ERRO] Falha ao iniciar servidor: {e}")
+                    print(f"[ERRO] Porta {self.cfg.listen_port}: {e}")
                 finally:
-                    self._running_ok = nonlocal_running_ok
+                    self._running_ok = ok
                     self._started.set()
 
             self._loop.create_task(_boot())
@@ -256,13 +292,14 @@ class ServerController:
                     self._loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
                 self._loop.close()
 
-        self._thread = threading.Thread(target=runner, name="proxy-server", daemon=True)
+        self._thread = threading.Thread(target=runner, name=f"proxy-{self.cfg.listen_port}", daemon=True)
         self._thread.start()
         self._started.wait(timeout=5)
         return self._running_ok
 
     def stop(self) -> None:
-        if not self.is_running():
+        if not (self._thread and self._thread.is_alive()):
+            self._running_ok = False
             return
         assert self._loop is not None and self._server is not None
 
@@ -271,21 +308,106 @@ class ServerController:
                 await self._server.shutdown()
                 self._loop.stop()
             asyncio.create_task(_inner())
-        self._loop.call_soon_threadsafe(_stopper)
 
+        self._loop.call_soon_threadsafe(_stopper)
         if self._thread:
             self._thread.join(timeout=5)
         self._thread = None
         self._loop = None
         self._server = None
-        self._started.clear()
         self._running_ok = False
 
     def is_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive() and self._running_ok
 
 # =========================
-# Menu minimalista
+# Gerenciador de múltiplas portas
+# =========================
+class MultiServerManager:
+    def __init__(self) -> None:
+        self._by_port: Dict[int, ServerController] = {}
+
+    def active_ports(self) -> List[int]:
+        # Retorna somente as portas realmente ativas
+        return sorted(p for p, c in self._by_port.items() if c.is_running())
+
+    def open_port(self, port: int) -> bool:
+        if port in self._by_port and self._by_port[port].is_running():
+            return True
+        cfg = ProxyConfig(listen_port=port)
+        ctrl = ServerController(cfg)
+        ok = ctrl.start()
+        if ok:
+            self._by_port[port] = ctrl
+        else:
+            # se já existia mas falhou agora, garante remoção
+            self._by_port.pop(port, None)
+        return ok
+
+    def close_port(self, port: int) -> bool:
+        ctrl = self._by_port.get(port)
+        if not ctrl:
+            return False
+        ctrl.stop()
+        self._by_port.pop(port, None)
+        return True
+
+    def close_all(self) -> None:
+        for p, ctrl in list(self._by_port.items()):
+            with contextlib.suppress(Exception):
+                ctrl.stop()
+        self._by_port.clear()
+
+    def any_running(self) -> bool:
+        return any(c.is_running() for c in self._by_port.values())
+
+# =========================
+# Util: remoção do próprio arquivo
+# =========================
+def remove_self_and_exit() -> None:
+    """
+    Tenta remover este arquivo imediatamente. Se falhar (ex.: Windows),
+    agenda a remoção ao encerrar o processo.
+    """
+    path = os.path.realpath(__file__)
+    try:
+        os.remove(path)
+        print(f"[OK] Arquivo removido: {path}")
+        sys.exit(0)
+    except Exception as e:
+        if os.name == "nt":
+            # Agenda remoção via .bat
+            try:
+                bat = os.path.join(tempfile.gettempdir(), "rm_proxy_menu.bat")
+                with open(bat, "w", encoding="utf-8") as f:
+                    f.write(f"""@echo off
+ping 127.0.0.1 -n 2 >NUL
+del /F /Q "{path}"
+if exist "{path}" (
+  timeout /T 2 >NUL
+  del /F /Q "{path}"
+)
+del /F /Q "%~f0"
+""")
+                creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                subprocess.Popen(["cmd", "/c", bat], creationflags=creationflags)
+                print("[OK] Remoção agendada; o arquivo será apagado ao encerrar.")
+                sys.exit(0)
+            except Exception as e2:
+                print(f"[ERRO] Falha ao agendar remoção: {e2}")
+                sys.exit(1)
+        else:
+            # Unix-like: agenda remoção após 1s
+            try:
+                subprocess.Popen(["sh", "-c", f'sleep 1; rm -f "{path}"'])
+                print("[OK] Remoção agendada; o arquivo será apagado ao encerrar.")
+                sys.exit(0)
+            except Exception as e2:
+                print(f"[ERRO] Falha ao agendar remoção: {e2}")
+                sys.exit(1)
+
+# =========================
+# Menu
 # =========================
 def ask_port(default_port: int) -> int:
     raw = input(f"Digite a porta para abrir [{default_port}]: ").strip()
@@ -301,39 +423,58 @@ def ask_port(default_port: int) -> int:
         return default_port
 
 def run_menu() -> None:
-    cfg = ProxyConfig()
-    ctrl = ServerController(cfg)
+    mgr = MultiServerManager()
+    default_port = 80
 
     while True:
-        status = f"ATIVO (porta {cfg.listen_port})" if ctrl.is_running() else "INATIVO"
-        print("\n==============================")
-        print(f"  STATUS: {status}")
+        ports = mgr.active_ports()
+        if ports:
+            print(f"\nstatus: ativo p.: {', '.join(str(p) for p in ports)}")
+        else:
+            print("\nstatus: Inativo")
+
         print("==============================")
         print("1) Abrir porta")
         print("2) Fechar porta")
+        print("3) Desativar TODAS as portas e remover COMPLETAMENTE este arquivo")
         print("0) Sair")
         choice = input("Escolha: ").strip()
 
         if choice == "1":
-            if ctrl.is_running():
-                print("[INFO] Já está ativo. Feche antes se quiser trocar de porta.")
-                continue
-            cfg.listen_port = ask_port(cfg.listen_port)
-            ok = ctrl.start()
+            port = ask_port(default_port)
+            ok = mgr.open_port(port)
             if ok:
-                print(f"[OK] Porta aberta em {cfg.listen_port}.")
-                print("    (Dica: portas <1024 exigem sudo em Unix)")
+                print(f"[OK] Porta {port} aberta.")
+                default_port = port  # atualiza sugestão
+                if port < 1024 and os.name != "nt":
+                    print("    (Atenção: portas <1024 costumam exigir sudo em Unix)")
             else:
-                print("[ERRO] Não foi possível abrir a porta. Verifique permissões/conflitos.")
+                print(f"[ERRO] Falhou ao abrir a porta {port}.")
+                print("      Dicas: porta em uso, permissão insuficiente, firewall/antivírus.")
         elif choice == "2":
-            if not ctrl.is_running():
-                print("[INFO] Já está inativo.")
+            if not ports:
+                print("[INFO] Nenhuma porta ativa.")
                 continue
-            ctrl.stop()
-            print("[OK] Porta fechada.")
+            try:
+                p = int(input(f"Porta para fechar [{ports[0]}]: ").strip() or ports[0])
+            except ValueError:
+                print("[ERRO] Porta inválida.")
+                continue
+            if mgr.close_port(p):
+                print(f"[OK] Porta {p} fechada.")
+            else:
+                print(f"[INFO] Porta {p} não estava ativa.")
+        elif choice == "3":
+            resp = input("Confirmar: encerrar todas as portas e REMOVER este arquivo? (s/N): ").strip().lower()
+            if resp == "s":
+                mgr.close_all()
+                print("[OK] Todas as portas foram desativadas.")
+                # remove a si mesmo e encerra
+                remove_self_and_exit()
+            else:
+                print("[INFO] Operação cancelada.")
         elif choice == "0":
-            if ctrl.is_running():
-                ctrl.stop()
+            mgr.close_all()
             print("Saindo...")
             break
         else:
