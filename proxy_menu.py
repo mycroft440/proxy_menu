@@ -341,6 +341,7 @@ def run_menu() -> None:
 
         print(f"  {C_YELLOW}[1]{C_RESET} - Iniciar Proxy")
         print(f"  {C_YELLOW}[2]{C_RESET} - Parar Proxy")
+        print(f"  {C_RED}[3]{C_RESET} - Remover Proxy")
         print(f"  {C_YELLOW}[0]{C_RESET} - Sair\n")
         
         choice = input(f"  {C_CYAN}› Selecione uma opção: {C_RESET}").strip()
@@ -379,6 +380,33 @@ def run_menu() -> None:
                 print(f"  {C_GREEN}✔ Proxy interrompido com sucesso.{C_RESET}")
             time.sleep(2)
 
+        elif choice == "3":
+            print(f"\n  {C_RED}{C_BOLD}ATENÇÃO: Esta ação removerá o próprio arquivo do proxy permanentemente.{C_RESET}")
+            confirm = input(f"  {C_CYAN}› Deseja realmente continuar? (s/N): {C_RESET}").strip().lower()
+            
+            if confirm == 's':
+                if ctrl.is_running():
+                    print(f"\n  {C_WHITE}Parando o proxy antes de remover...{C_RESET}")
+                    ctrl.stop()
+                    time.sleep(1)
+
+                try:
+                    script_path = os.path.abspath(__file__)
+                    print(f"  {C_WHITE}Removendo o arquivo: {script_path}{C_RESET}")
+                    os.remove(script_path)
+                    print(f"  {C_GREEN}✔ Proxy removido com sucesso.{C_RESET}")
+                    print(f"  {C_BLUE}👋 Saindo...{C_RESET}")
+                    time.sleep(2)
+                    break 
+                except Exception as e:
+                    print(f"\n  {C_RED}✘ Erro ao remover o arquivo: {e}{C_RESET}")
+                    print(f"  {C_YELLOW}  Por favor, remova o arquivo manualmente.{C_RESET}")
+                    time.sleep(4)
+                    break 
+            else:
+                print(f"\n  {C_YELLOW}💡 Remoção cancelada.{C_RESET}")
+                time.sleep(2)
+
         elif choice == "0":
             if ctrl.is_running():
                 print(f"\n  {C_WHITE}Parando o proxy antes de sair...{C_RESET}")
@@ -402,3 +430,4 @@ if __name__ == "__main__":
         # Lógica de limpeza não é estritamente necessária por causa da `thread daemon`,
         # mas é uma boa prática em programas mais complexos.
         pass
+
