@@ -99,7 +99,7 @@ class AsyncProxyIdentico:
         listen_sock.listen(128)
         listen_sock.setblocking(False)
         self._listen_sock = listen_sock
-        # A mensagem de listen foi movida para o menu para não poluir a tela
+        
         try:
             while not self._stop_event.is_set():
                 try:
@@ -107,20 +107,24 @@ class AsyncProxyIdentico:
                 except asyncio.CancelledError:
                     break
                 except OSError:
+                    # Ocorre quando o socket é fechado enquanto o accept aguarda
                     continue
                 client_sock.setblocking(False)
                 # processa cliente
                 asyncio.create_task(self._handle_client(client_sock))
         finally:
-            with contextlib.suppress(Exception):
-                listen_sock.close()
+            if self._listen_sock:
+                with contextlib.suppress(Exception):
+                    self._listen_sock.close()
 
     async def stop(self) -> None:
         """Sinaliza parada e fecha o listener."""
         self._stop_event.set()
         if self._listen_sock:
             with contextlib.suppress(Exception):
+                # Fechar o socket força o 'sock_accept' a lançar uma exceção e desbloquear
                 self._listen_sock.close()
+                self._listen_sock = None
 
     async def _handle_client(self, client_sock: socket.socket) -> None:
         assert self.loop is not None
@@ -174,6 +178,7 @@ class ProxyController:
         self.port: int | None = None
         self.status: str | None = None
         self.error_message: str | None = None
+        self._server_task: asyncio.Task | None = None
 
     def start(self, port: int, status: str) -> bool:
         """Inicia o proxy em background. Retorna True se iniciou com sucesso."""
@@ -182,77 +187,92 @@ class ProxyController:
         self.port = port
         self.status = status
         self.error_message = None
-        started = threading.Event()
         
-        # Usamos um dicionário mutável para passar o resultado da thread
+        # Evento para sincronizar a thread principal com a de background
+        started_event = threading.Event()
         result = {"ok": False}
 
         def run():
-            self._loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self._loop)
-            self._server = AsyncProxyIdentico(port, status)
-            
-            async def runner():
-                try:
-                    # O await aqui garante que a porta foi aberta com sucesso
-                    await self._server.start()
-                    result["ok"] = True
-                except Exception as e:
-                    self.error_message = str(e)
-                    result["ok"] = False
-                finally:
-                    # Sinaliza que a tentativa de start terminou
-                    started.set()
+            nonlocal result
+            try:
+                self._loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(self._loop)
+                self._server = AsyncProxyIdentico(port, status)
+                
+                # Inicia o servidor e, mais importante, o loop de eventos
+                self._server_task = self._loop.create_task(self._server.start())
+                
+                # A exceção de `bind` ocorrerá aqui se houver um problema
+                # Para pegá-la, precisamos dar uma chance para a task rodar
+                async def check_startup():
+                    await asyncio.sleep(0.01) # dá tempo para o `bind` rodar
+                    if self._server_task and self._server_task.done():
+                        # Se a tarefa terminou rápido, provavelmente foi um erro
+                        try:
+                            self._server_task.result()
+                        except Exception as e:
+                            self.error_message = str(e)
+                            result["ok"] = False
+                            return
+                
+                # Verificamos a inicialização. Se falhar, o loop não continua.
+                self._loop.run_until_complete(check_startup())
+                
+                # Se o resultado já foi definido como falha, não continue
+                if "ok" in result and not result["ok"]:
+                    started_event.set()
+                    return
 
-            # Precisamos manter o loop rodando após o start
-            async def main_task():
-                start_task = self._loop.create_task(runner())
-                # Espera a conclusão de start para não bloquear para sempre
-                await asyncio.sleep(0) 
+                # Se chegamos aqui, o bind foi bem-sucedido
+                result["ok"] = True
+                started_event.set()
+                self._loop.run_forever()
 
-            self._loop.run_until_complete(main_task())
-            
-            if result["ok"]:
-                try:
-                    self._loop.run_forever()
-                finally:
-                    # Cleanup ao parar o loop
-                    pending = asyncio.all_tasks(loop=self._loop)
-                    for t in pending:
-                        t.cancel()
-                    with contextlib.suppress(Exception):
-                        self._loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            except Exception as e:
+                self.error_message = str(e)
+                result["ok"] = False
+            finally:
+                # Garante que o evento seja setado em caso de qualquer erro
+                if not started_event.is_set():
+                    started_event.set()
+                if self._loop and self._loop.is_running():
                     self._loop.close()
 
         self._thread = threading.Thread(target=run, daemon=True)
         self._thread.start()
         
-        # Aguarda o server sinalizar início ou erro
-        started.wait(timeout=5)
+        # Aguarda a thread de background sinalizar que a inicialização terminou
+        started_event.wait(timeout=5.0)
+        
+        if not result["ok"] and not self.error_message:
+            self.error_message = "Tempo limite para iniciar o servidor excedido."
+
         return result["ok"]
 
     def stop(self) -> None:
         """Encerra o proxy se estiver rodando."""
-        if not self.is_running():
+        if not self.is_running() or not self._loop or not self._server:
             return
-        assert self._loop is not None and self._server is not None
-        
-        def stopper():
-            async def inner():
+
+        def shutdown_sequence():
+            # Função a ser chamada no loop de eventos da outra thread
+            if self._server_task and not self._server_task.done():
+                self._server_task.cancel()
+            
+            async def stop_server_and_loop():
                 if self._server:
                     await self._server.stop()
                 if self._loop and self._loop.is_running():
                     self._loop.stop()
-            
-            # Garante que a task de parada seja executada
-            if self._loop and not self._loop.is_closed():
-                asyncio.run_coroutine_threadsafe(inner(), self._loop)
 
-        if self._loop and self._loop.is_running():
-            self._loop.call_soon_threadsafe(stopper)
+            # Agendamos a parada de forma segura
+            asyncio.create_task(stop_server_and_loop())
+
+        # call_soon_threadsafe é a forma correta de interagir com o loop de outra thread
+        self._loop.call_soon_threadsafe(shutdown_sequence)
         
         if self._thread:
-            self._thread.join(timeout=5)
+            self._thread.join(timeout=5.0)
             
         self._thread = None
         self._loop = None
@@ -267,7 +287,6 @@ class ProxyController:
 
 def ask_port(default: int) -> int | None:
     """Solicita porta ao usuário com valor padrão."""
-    # Cores ANSI
     C_CYAN = "\033[96m"
     C_YELLOW = "\033[93m"
     C_RESET = "\033[0m"
@@ -285,15 +304,11 @@ def ask_port(default: int) -> int | None:
         time.sleep(2)
         return None
 
-# ==============================================================================
-# A ÚNICA FUNÇÃO ALTERADA FOI A 'run_menu' ABAIXO
-# ==============================================================================
 def run_menu() -> None:
     """Executa o menu interativo com uma interface melhorada."""
     ctrl = ProxyController()
     default_port = DEFAULT_PORT
 
-    # --- Cores e Estilos ANSI ---
     C_RESET = "\033[0m"
     C_BOLD = "\033[1m"
     C_GREEN = "\033[92m"
@@ -304,19 +319,15 @@ def run_menu() -> None:
     C_WHITE = "\033[97m"
 
     def clear_screen():
-        """Limpa a tela do terminal."""
         os.system('cls' if sys.platform == 'win32' else 'clear')
 
     while True:
         clear_screen()
         
-        # --- Cabeçalho ---
         print(f"{C_BLUE}{C_BOLD}╔═══════════════════════════════════════════════╗")
         print(f"║        Gerenciador de Proxy ({STATUS_BANNER})        ║")
-        print(f"╚═══════════════════════════════════════════════╝{C_RESET}")
-        print()
+        print(f"╚═══════════════════════════════════════════════╝{C_RESET}\n")
 
-        # --- Status do Servidor ---
         if ctrl.is_running() and ctrl.port is not None:
             status_line = f"  {C_BOLD}Status:{C_RESET} {C_GREEN}ATIVO ✅{C_RESET}"
             port_line = f"  {C_BOLD}Porta:{C_RESET} {C_WHITE}{ctrl.port}{C_RESET}"
@@ -328,14 +339,12 @@ def run_menu() -> None:
         
         print("\n" + "="*47 + "\n")
 
-        # --- Opções do Menu ---
         print(f"  {C_YELLOW}[1]{C_RESET} - Iniciar Proxy")
         print(f"  {C_YELLOW}[2]{C_RESET} - Parar Proxy")
         print(f"  {C_YELLOW}[0]{C_RESET} - Sair\n")
         
         choice = input(f"  {C_CYAN}› Selecione uma opção: {C_RESET}").strip()
 
-        # --- Lógica das Opções ---
         if choice == "1":
             if ctrl.is_running():
                 print(f"\n  {C_YELLOW}💡 O proxy já está ativo. Pare-o antes de iniciar novamente.{C_RESET}")
@@ -343,7 +352,7 @@ def run_menu() -> None:
                 continue
             
             port = ask_port(default_port)
-            if port is None:  # Usuário digitou porta inválida
+            if port is None:
                 continue
 
             print(f"\n  {C_WHITE}Iniciando o proxy na porta {port}...{C_RESET}")
@@ -353,13 +362,13 @@ def run_menu() -> None:
                 print(f"  {C_GREEN}✔ Proxy iniciado com sucesso na porta {port}.{C_RESET}")
                 default_port = port
                 if port < 1024 and sys.platform != 'win32':
-                    print(f"  {C_YELLOW} (Atenção: Portas < 1024 podem exigir privilégios de administrador){C_RESET}")
-                time.sleep(2)
+                    print(f"  {C_YELLOW}  (Atenção: Portas < 1024 podem exigir privilégios de administrador){C_RESET}")
+                time.sleep(2.5)
             else:
                 print(f"  {C_RED}✘ Falha ao iniciar o proxy na porta {port}.{C_RESET}")
                 if ctrl.error_message:
                     print(f"    {C_RED}Motivo: {ctrl.error_message}{C_RESET}")
-                time.sleep(3)
+                time.sleep(4)
 
         elif choice == "2":
             if not ctrl.is_running():
@@ -374,7 +383,7 @@ def run_menu() -> None:
             if ctrl.is_running():
                 print(f"\n  {C_WHITE}Parando o proxy antes de sair...{C_RESET}")
                 ctrl.stop()
-            print(f"  {C_BLUE}👋 Até logo!{C_RESET}")
+            print(f"\n  {C_BLUE}👋 Até logo!{C_RESET}")
             break
 
         else:
@@ -383,7 +392,13 @@ def run_menu() -> None:
 
 
 if __name__ == "__main__":
+    # Garante que o controlador pare corretamente ao sair com Ctrl+C
+    main_controller = None
     try:
         run_menu()
     except KeyboardInterrupt:
         print("\n\nEncerrado pelo usuário.")
+    finally:
+        # Lógica de limpeza não é estritamente necessária por causa da `thread daemon`,
+        # mas é uma boa prática em programas mais complexos.
+        pass
