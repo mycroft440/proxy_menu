@@ -11,6 +11,8 @@ Sequência (idêntica ao Rust, conforme esperado):
   6) Faz a cópia bidirecional de dados até EOF/erro
 """
 
+
+
 import argparse
 import asyncio
 import contextlib
