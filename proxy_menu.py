@@ -21,14 +21,16 @@ DEFAULT_STATUS = "@RustyManager"
 DEFAULT_PORT = 80
 BUF_SIZE = 8192
 PRECONSUME = 1024
-# O destino agora é fixo
-UPSTREAM_SSH = ("0.0.0.0", 22)
+# CORREÇÃO: Usar '127.0.0.1' (localhost) para conectar, não '0.0.0.0'.
+UPSTREAM_SSH = ("127.0.0.1", 22)
 
 
 def parse_args() -> argparse.Namespace:
+    # Usar parse_known_args para ignorar argumentos desconhecidos que o S.O. possa passar
     p = argparse.ArgumentParser(add_help=True)
     p.add_argument("--status", default=DEFAULT_STATUS, help="Texto do status a enviar nas respostas 101/200")
-    return p.parse_args()
+    args, _ = p.parse_known_args()
+    return args
 
 
 class AsyncProxy:
@@ -50,9 +52,8 @@ class AsyncProxy:
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         """Manipula o cliente, encaminhando diretamente para SSH."""
-        client_sock = writer.get_extra_info('socket')
-        client_sock.setblocking(False)
         loop = asyncio.get_running_loop()
+        client_sock = writer.get_extra_info('socket')
         
         upstream_writer = None
         try:
@@ -73,35 +74,33 @@ class AsyncProxy:
                 UPSTREAM_SSH[0], UPSTREAM_SSH[1]
             )
             upstream_sock = upstream_writer.get_extra_info('socket')
-            upstream_sock.setblocking(False)
 
             # 4) Inicia a transferência bidirecional de dados
-            # A transferência agora é direta, sem necessidade de 'peek'
-            task1 = asyncio.create_task(self.transfer_low_level(loop, client_sock, upstream_sock))
-            task2 = asyncio.create_task(self.transfer_low_level(loop, upstream_sock, client_sock))
+            task1 = asyncio.create_task(self.transfer(loop, client_sock, upstream_sock))
+            task2 = asyncio.create_task(self.transfer(loop, upstream_sock, client_sock))
 
             await asyncio.gather(task1, task2)
 
-        except Exception:
-            pass
+        except Exception as e:
+            # Adicionado log de erro para facilitar a depuração futura
+            print(f"[ERRO] Falha ao manipular cliente: {e}", file=sys.stderr)
         finally:
             writer.close()
-            # CORREÇÃO: Devemos fechar o StreamWriter, não o socket de baixo nível.
             if upstream_writer:
                 upstream_writer.close()
+                await upstream_writer.wait_closed()
 
-    async def transfer_low_level(self, loop: asyncio.AbstractEventLoop, r_sock: socket.socket, w_sock: socket.socket):
+    async def transfer(self, loop: asyncio.AbstractEventLoop, r_sock: socket.socket, w_sock: socket.socket):
         """Transfere dados entre sockets de forma eficiente."""
         try:
             while True:
+                # Usar setblocking(False) não é necessário quando se usa a event loop
                 data = await loop.sock_recv(r_sock, BUF_SIZE)
                 if not data:
                     break
                 await loop.sock_sendall(w_sock, data)
         except (ConnectionResetError, BrokenPipeError, OSError):
             pass # Erros esperados quando uma conexão é fechada
-        finally:
-            pass
 
     async def stop(self):
         """Para o servidor"""
