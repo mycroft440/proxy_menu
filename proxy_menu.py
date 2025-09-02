@@ -2,9 +2,10 @@
 """
 Menu interativo para um proxy com encaminhamento direto para SSH.
 
-Esta versão inclui um sistema de logging profundo para diagnosticar
-problemas de conexão. Os logs são guardados em /tmp/proxy.log e
-podem ser visualizados/limpos através do menu.
+Versão final e estável que usa a abstração de Streams de alto nível do asyncio
+(StreamReader/StreamWriter) para garantir a estabilidade e evitar erros de
+socket de baixo nível. Inclui um sistema de logging profundo para diagnosticar
+problemas.
 """
 
 import argparse
@@ -19,12 +20,14 @@ from typing import Optional
 
 # ==== Configuração dos Logs ====
 LOG_FILE = "/tmp/proxy.log"
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s - %(levelname)s - %(threadName)s - %(message)s',
-    filename=LOG_FILE,
-    filemode='a'
-)
+# Previne que múltiplos handlers sejam adicionados
+if not logging.getLogger(__name__).handlers:
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format='%(asctime)s - %(levelname)s - %(threadName)s - [%(funcName)s] - %(message)s',
+        filename=LOG_FILE,
+        filemode='a'
+    )
 logger = logging.getLogger(__name__)
 
 # ==== Parâmetros ====
@@ -60,72 +63,74 @@ class AsyncProxy:
         logger.info(f"Servidor iniciado e a escutar na porta {self.port}")
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-        """Manipula o cliente, encaminhando diretamente para SSH com logs detalhados."""
-        loop = asyncio.get_running_loop()
+        """Manipula o cliente usando exclusivamente Streams de alto nível."""
         client_addr = writer.get_extra_info('peername')
         logger.info(f"Nova conexão de {client_addr}")
 
         upstream_writer = None
         try:
-            # 1) Responde ao handshake HTTP do cliente
+            # 1) Handshake HTTP
             logger.debug(f"[{client_addr}] Enviando HTTP/1.1 101")
-            response_101 = f"HTTP/1.1 101 {self.status}\r\n\r\n"
-            writer.write(response_101.encode())
+            writer.write(f"HTTP/1.1 101 {self.status}\r\n\r\n".encode())
             await writer.drain()
 
-            # 2) Lê e descarta o payload inicial
             logger.debug(f"[{client_addr}] Lendo payload inicial (até {PRECONSUME} bytes)")
             await reader.read(PRECONSUME)
-            logger.debug(f"[{client_addr}] Payload lido")
 
             logger.debug(f"[{client_addr}] Enviando HTTP/1.1 200")
-            response_200 = f"HTTP/1.1 200 {self.status}\r\n\r\n"
-            writer.write(response_200.encode())
+            writer.write(f"HTTP/1.1 200 {self.status}\r\n\r\n".encode())
             await writer.drain()
-            logger.info(f"[{client_addr}] Handshake concluído. Tentando conectar ao upstream.")
+            logger.info(f"[{client_addr}] Handshake concluído.")
 
-            # 3) Conecta-se diretamente ao destino SSH
+            # 2) Conexão com o destino
             logger.debug(f"[{client_addr}] Conectando ao upstream em {UPSTREAM_SSH}")
             upstream_reader, upstream_writer = await asyncio.open_connection(
                 UPSTREAM_SSH[0], UPSTREAM_SSH[1]
             )
-            upstream_sock = upstream_writer.get_extra_info('socket')
-            client_sock = writer.get_extra_info('socket')
             logger.info(f"[{client_addr}] Conexão com upstream {UPSTREAM_SSH} estabelecida.")
 
-            # 4) Inicia a transferência bidirecional de dados
-            logger.debug(f"[{client_addr}] Iniciando transferência bidirecional de dados.")
-            task1 = asyncio.create_task(self.transfer(loop, client_sock, upstream_sock, f"{client_addr} -> UPSTREAM"))
-            task2 = asyncio.create_task(self.transfer(loop, upstream_sock, client_sock, f"UPSTREAM -> {client_addr}"))
+            # 3) Transferência bidirecional usando a API correta
+            logger.debug(f"[{client_addr}] Iniciando transferência bidirecional.")
+            task1 = asyncio.create_task(self.transfer(reader, upstream_writer, f"{client_addr} -> UPSTREAM"))
+            task2 = asyncio.create_task(self.transfer(upstream_reader, writer, f"UPSTREAM -> {client_addr}"))
 
             await asyncio.gather(task1, task2)
             logger.debug(f"[{client_addr}] Transferência de dados concluída.")
 
         except ConnectionRefusedError:
-            logger.error(f"[{client_addr}] Falha ao conectar ao upstream: Conexão recusada. O serviço SSH está a correr em {UPSTREAM_SSH}?")
+            logger.error(f"[{client_addr}] Falha ao conectar: Conexão recusada. O serviço SSH está a correr em {UPSTREAM_SSH}?")
         except Exception as e:
-            logger.error(f"[{client_addr}] Erro inesperado em handle_client: {e}", exc_info=True)
+            logger.error(f"[{client_addr}] Erro inesperado: {e}", exc_info=True)
         finally:
             logger.info(f"[{client_addr}] Encerrando conexão.")
-            writer.close()
-            if upstream_writer:
+            if not writer.is_closing():
+                writer.close()
+                await writer.wait_closed()
+            if upstream_writer and not upstream_writer.is_closing():
                 upstream_writer.close()
                 await upstream_writer.wait_closed()
 
-    async def transfer(self, loop: asyncio.AbstractEventLoop, r_sock: socket.socket, w_sock: socket.socket, direction: str):
-        """Transfere dados entre sockets de forma eficiente com logs."""
+    async def transfer(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, direction: str):
+        """
+        CORREÇÃO: Transfere dados usando reader.read() e writer.write(),
+        a API de alto nível correta para Streams.
+        """
         try:
             while True:
-                data = await loop.sock_recv(r_sock, BUF_SIZE)
+                data = await reader.read(BUF_SIZE) # <<< USA .read()
                 if not data:
                     logger.debug(f"[{direction}] Fim do stream (EOF).")
                     break
                 logger.debug(f"[{direction}] Transferindo {len(data)} bytes.")
-                await loop.sock_sendall(w_sock, data)
-        except (ConnectionResetError, BrokenPipeError, OSError):
-            logger.warning(f"[{direction}] Conexão de transferência redefinida/quebrada.")
+                writer.write(data) # <<< USA .write()
+                await writer.drain()
+        except (ConnectionResetError, asyncio.IncompleteReadError):
+            logger.warning(f"[{direction}] Conexão de transferência redefinida.")
         except Exception as e:
-            logger.error(f"[{direction}] Erro inesperado na transferência: {e}", exc_info=True)
+            logger.error(f"[{direction}] Erro na transferência: {e}", exc_info=True)
+        finally:
+            if not writer.is_closing():
+                writer.close()
 
 
     async def stop(self):
@@ -155,7 +160,6 @@ class ProxyController:
         self._started_event.clear()
         result = {"success": False}
         def run_proxy():
-            # Dar um nome à thread para aparecer nos logs
             threading.current_thread().name = "ProxyThread"
             try:
                 self._loop = asyncio.new_event_loop()
@@ -293,7 +297,6 @@ def run_menu(status: str) -> None:
             print(f"\n  {C_RED}✘ Opção inválida.{C_RESET}"); time.sleep(1.5)
 
 if __name__ == "__main__":
-    # Dar um nome à thread principal para aparecer nos logs
     threading.current_thread().name = "MainThread"
     logger.info("="*20 + " Script do Menu Iniciado " + "="*20)
     args = parse_args()
