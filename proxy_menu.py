@@ -54,7 +54,7 @@ class AsyncProxy:
         client_sock.setblocking(False)
         loop = asyncio.get_running_loop()
         
-        upstream_sock = None
+        upstream_writer = None
         try:
             # 1) Responde ao handshake HTTP do cliente
             response_101 = f"HTTP/1.1 101 {self.status}\r\n\r\n"
@@ -86,8 +86,9 @@ class AsyncProxy:
             pass
         finally:
             writer.close()
-            if upstream_sock:
-                upstream_sock.close()
+            # CORREÇÃO: Devemos fechar o StreamWriter, não o socket de baixo nível.
+            if upstream_writer:
+                upstream_writer.close()
 
     async def transfer_low_level(self, loop: asyncio.AbstractEventLoop, r_sock: socket.socket, w_sock: socket.socket):
         """Transfere dados entre sockets de forma eficiente."""
@@ -246,3 +247,4 @@ if __name__ == "__main__":
         run_menu(status=args.status)
     except KeyboardInterrupt:
         print("\n\nEncerrado pelo utilizador.")
+
