@@ -2,10 +2,9 @@
 """
 Menu interativo para um proxy com encaminhamento direto para SSH.
 
-Versão final e estável que usa a abstração de Streams de alto nível do asyncio
-(StreamReader/StreamWriter) para garantir a estabilidade e evitar erros de
-socket de baixo nível. Inclui um sistema de logging profundo para diagnosticar
-problemas.
+Versão final que utiliza a event loop de baixo nível do asyncio para
+manipular sockets diretamente, replicando o comportamento de alta performance
+do Rust e resolvendo problemas de timing com o handshake SSH.
 """
 
 import argparse
@@ -20,10 +19,9 @@ from typing import Optional
 
 # ==== Configuração dos Logs ====
 LOG_FILE = "/tmp/proxy.log"
-# Previne que múltiplos handlers sejam adicionados se o script for importado
 if not logging.getLogger(__name__).handlers:
     logging.basicConfig(
-        level=logging.DEBUG,
+        level=logging.INFO, # Alterado para INFO para logs mais limpos, DEBUG para mais detalhes
         format='%(asctime)s - %(levelname)s - %(threadName)s - [%(funcName)s] - %(message)s',
         filename=LOG_FILE,
         filemode='a'
@@ -63,21 +61,21 @@ class AsyncProxy:
         logger.info(f"Servidor iniciado e a escutar na porta {self.port}")
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-        """Manipula o cliente usando exclusivamente Streams de alto nível."""
+        """Manipula o cliente usando sockets de baixo nível para a transferência."""
         client_addr = writer.get_extra_info('peername')
         logger.info(f"Nova conexão de {client_addr}")
 
+        # Obtém o socket de baixo nível do cliente
+        client_sock = writer.get_extra_info('socket')
+        loop = asyncio.get_running_loop()
+        
         upstream_writer = None
         try:
-            # 1) Handshake HTTP
-            logger.debug(f"[{client_addr}] Enviando HTTP/1.1 101")
+            # 1) Handshake HTTP (usando streams para simplicidade)
+            logger.debug(f"[{client_addr}] Enviando handshake HTTP")
             writer.write(f"HTTP/1.1 101 {self.status}\r\n\r\n".encode())
             await writer.drain()
-
-            logger.debug(f"[{client_addr}] Lendo payload inicial (até {PRECONSUME} bytes)")
             await reader.read(PRECONSUME)
-
-            logger.debug(f"[{client_addr}] Enviando HTTP/1.1 200")
             writer.write(f"HTTP/1.1 200 {self.status}\r\n\r\n".encode())
             await writer.drain()
             logger.info(f"[{client_addr}] Handshake concluído.")
@@ -87,12 +85,14 @@ class AsyncProxy:
             upstream_reader, upstream_writer = await asyncio.open_connection(
                 UPSTREAM_SSH[0], UPSTREAM_SSH[1]
             )
-            logger.info(f"[{client_addr}] Conexão com upstream {UPSTREAM_SSH} estabelecida.")
+            # Obtém o socket de baixo nível do upstream
+            upstream_sock = upstream_writer.get_extra_info('socket')
+            logger.info(f"[{client_addr}] Conexão com upstream estabelecida.")
 
-            # 3) Transferência bidirecional usando a API correta
-            logger.debug(f"[{client_addr}] Iniciando transferência bidirecional.")
-            task1 = asyncio.create_task(self.transfer(reader, upstream_writer, f"{client_addr} -> UPSTREAM"))
-            task2 = asyncio.create_task(self.transfer(upstream_reader, writer, f"UPSTREAM -> {client_addr}"))
+            # 3) Transferência bidirecional de baixo nível (a chave da solução)
+            logger.debug(f"[{client_addr}] Iniciando transferência de baixo nível.")
+            task1 = asyncio.create_task(self.transfer_low_level(loop, client_sock, upstream_sock, f"{client_addr} -> UPSTREAM"))
+            task2 = asyncio.create_task(self.transfer_low_level(loop, upstream_sock, client_sock, f"UPSTREAM -> {client_addr}"))
 
             await asyncio.gather(task1, task2)
             logger.debug(f"[{client_addr}] Transferência de dados concluída.")
@@ -105,29 +105,26 @@ class AsyncProxy:
             logger.info(f"[{client_addr}] Encerrando conexão.")
             if writer and not writer.is_closing():
                 writer.close()
-                await writer.wait_closed()
             if upstream_writer and not upstream_writer.is_closing():
                 upstream_writer.close()
-                await upstream_writer.wait_closed()
 
-    async def transfer(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, direction: str):
-        """Transfere dados usando reader.read() e writer.write()"""
+    async def transfer_low_level(self, loop: asyncio.AbstractEventLoop, r_sock: socket.socket, w_sock: socket.socket, direction: str):
+        """Transfere dados entre sockets usando a event loop."""
         try:
             while True:
-                data = await reader.read(BUF_SIZE)
+                data = await loop.sock_recv(r_sock, BUF_SIZE)
                 if not data:
-                    logger.debug(f"[{direction}] Fim do stream (EOF).")
+                    logger.info(f"[{direction}] Fim do stream (EOF).")
                     break
-                logger.debug(f"[{direction}] Transferindo {len(data)} bytes.")
-                writer.write(data)
-                await writer.drain()
-        except (ConnectionResetError, asyncio.IncompleteReadError):
+                await loop.sock_sendall(w_sock, data)
+        except (ConnectionResetError, BrokenPipeError, OSError):
             logger.warning(f"[{direction}] Conexão de transferência redefinida.")
         except Exception as e:
-            logger.error(f"[{direction}] Erro na transferência: {e}", exc_info=True)
+            logger.error(f"[{direction}] Erro na transferência de baixo nível: {e}", exc_info=True)
         finally:
-            if writer and not writer.is_closing():
-                writer.close()
+             # Garante que o lado de escrita seja fechado para sinalizar o fim da transmissão
+            if w_sock:
+                w_sock.shutdown(socket.SHUT_WR)
 
 
     async def stop(self):
@@ -305,4 +302,3 @@ if __name__ == "__main__":
     except Exception as e:
         logger.critical(f"Erro fatal na thread principal: {e}", exc_info=True)
         print(f"\n\nOcorreu um erro fatal. Verifique {LOG_FILE} para detalhes.")
-
