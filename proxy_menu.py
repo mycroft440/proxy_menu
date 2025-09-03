@@ -65,13 +65,13 @@ class AsyncProxy:
         client_addr = writer.get_extra_info('peername')
         logger.info(f"Nova conexão de {client_addr}")
 
-        # Obtém o socket de baixo nível do cliente
         client_sock = writer.get_extra_info('socket')
         loop = asyncio.get_running_loop()
         
+        upstream_sock = None
         upstream_writer = None
         try:
-            # 1) Handshake HTTP (usando streams para simplicidade)
+            # 1) Handshake HTTP
             logger.debug(f"[{client_addr}] Enviando handshake HTTP")
             writer.write(f"HTTP/1.1 101 {self.status}\r\n\r\n".encode())
             await writer.drain()
@@ -85,11 +85,10 @@ class AsyncProxy:
             upstream_reader, upstream_writer = await asyncio.open_connection(
                 UPSTREAM_SSH[0], UPSTREAM_SSH[1]
             )
-            # Obtém o socket de baixo nível do upstream
             upstream_sock = upstream_writer.get_extra_info('socket')
             logger.info(f"[{client_addr}] Conexão com upstream estabelecida.")
 
-            # 3) Transferência bidirecional de baixo nível (a chave da solução)
+            # 3) Transferência bidirecional de baixo nível
             logger.debug(f"[{client_addr}] Iniciando transferência de baixo nível.")
             task1 = asyncio.create_task(self.transfer_low_level(loop, client_sock, upstream_sock, f"{client_addr} -> UPSTREAM"))
             task2 = asyncio.create_task(self.transfer_low_level(loop, upstream_sock, client_sock, f"UPSTREAM -> {client_addr}"))
@@ -103,10 +102,17 @@ class AsyncProxy:
             logger.error(f"[{client_addr}] Erro inesperado: {e}", exc_info=True)
         finally:
             logger.info(f"[{client_addr}] Encerrando conexão.")
+            # CORREÇÃO: Fechar os sockets diretamente
+            if client_sock:
+                client_sock.close()
+            if upstream_sock:
+                upstream_sock.close()
+            # O writer de alto nível também deve ser fechado se ainda existir
             if writer and not writer.is_closing():
                 writer.close()
             if upstream_writer and not upstream_writer.is_closing():
                 upstream_writer.close()
+
 
     async def transfer_low_level(self, loop: asyncio.AbstractEventLoop, r_sock: socket.socket, w_sock: socket.socket, direction: str):
         """Transfere dados entre sockets usando a event loop."""
@@ -122,9 +128,13 @@ class AsyncProxy:
         except Exception as e:
             logger.error(f"[{direction}] Erro na transferência de baixo nível: {e}", exc_info=True)
         finally:
-             # Garante que o lado de escrita seja fechado para sinalizar o fim da transmissão
-            if w_sock:
-                w_sock.shutdown(socket.SHUT_WR)
+            try:
+                # Garante que o lado de escrita seja fechado para sinalizar o fim da transmissão
+                if w_sock:
+                    w_sock.shutdown(socket.SHUT_WR)
+            except OSError:
+                # Ignora o erro se o socket já estiver fechado
+                pass
 
 
     async def stop(self):
