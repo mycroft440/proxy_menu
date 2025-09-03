@@ -2,9 +2,10 @@
 """
 Menu interativo para um proxy com encaminhamento direto para SSH.
 
-Versão final que utiliza a event loop de baixo nível do asyncio para
-manipular sockets diretamente, replicando o comportamento de alta performance
-do Rust e resolvendo problemas de timing com o handshake SSH.
+Versão final e definitiva que utiliza a event loop de baixo nível do asyncio
+para manipular sockets diretamente. Esta abordagem replica o comportamento de
+alta performance do Rust (Tokio), resolvendo problemas de timing com o
+handshake SSH e garantindo uma conexão estável.
 """
 
 import argparse
@@ -21,7 +22,7 @@ from typing import Optional
 LOG_FILE = "/tmp/proxy.log"
 if not logging.getLogger(__name__).handlers:
     logging.basicConfig(
-        level=logging.INFO, # Alterado para INFO para logs mais limpos, DEBUG para mais detalhes
+        level=logging.INFO, # Use INFO para produção, DEBUG para depuração intensa
         format='%(asctime)s - %(levelname)s - %(threadName)s - [%(funcName)s] - %(message)s',
         filename=LOG_FILE,
         filemode='a'
@@ -61,7 +62,7 @@ class AsyncProxy:
         logger.info(f"Servidor iniciado e a escutar na porta {self.port}")
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-        """Manipula o cliente usando sockets de baixo nível para a transferência."""
+        """Manipula o cliente usando sockets de baixo nível para a transferência de dados."""
         client_addr = writer.get_extra_info('peername')
         logger.info(f"Nova conexão de {client_addr}")
 
@@ -69,19 +70,20 @@ class AsyncProxy:
         loop = asyncio.get_running_loop()
         
         upstream_sock = None
-        upstream_writer = None
+        upstream_writer = None # Mantemos para fechar corretamente
         try:
-            # 1) Handshake HTTP
-            logger.debug(f"[{client_addr}] Enviando handshake HTTP")
+            # 1) Handshake HTTP (usando streams, que é seguro para esta parte)
+            logger.debug(f"[{client_addr}] A realizar handshake HTTP.")
             writer.write(f"HTTP/1.1 101 {self.status}\r\n\r\n".encode())
             await writer.drain()
-            await reader.read(PRECONSUME)
+            # Usar readexactly para garantir que lemos o payload esperado
+            await reader.readexactly(PRECONSUME)
             writer.write(f"HTTP/1.1 200 {self.status}\r\n\r\n".encode())
             await writer.drain()
             logger.info(f"[{client_addr}] Handshake concluído.")
 
-            # 2) Conexão com o destino
-            logger.debug(f"[{client_addr}] Conectando ao upstream em {UPSTREAM_SSH}")
+            # 2) Conexão com o destino (upstream)
+            logger.debug(f"[{client_addr}] A conectar ao upstream em {UPSTREAM_SSH}")
             upstream_reader, upstream_writer = await asyncio.open_connection(
                 UPSTREAM_SSH[0], UPSTREAM_SSH[1]
             )
@@ -89,29 +91,31 @@ class AsyncProxy:
             logger.info(f"[{client_addr}] Conexão com upstream estabelecida.")
 
             # 3) Transferência bidirecional de baixo nível
-            logger.debug(f"[{client_addr}] Iniciando transferência de baixo nível.")
+            logger.debug(f"[{client_addr}] A iniciar transferência de dados de baixo nível.")
             task1 = asyncio.create_task(self.transfer_low_level(loop, client_sock, upstream_sock, f"{client_addr} -> UPSTREAM"))
             task2 = asyncio.create_task(self.transfer_low_level(loop, upstream_sock, client_sock, f"UPSTREAM -> {client_addr}"))
 
             await asyncio.gather(task1, task2)
             logger.debug(f"[{client_addr}] Transferência de dados concluída.")
 
+        except asyncio.IncompleteReadError:
+            logger.warning(f"[{client_addr}] O cliente fechou a conexão durante o handshake (payload incompleto).")
         except ConnectionRefusedError:
             logger.error(f"[{client_addr}] Falha ao conectar: Conexão recusada. O serviço SSH está a correr em {UPSTREAM_SSH}?")
         except Exception as e:
-            logger.error(f"[{client_addr}] Erro inesperado: {e}", exc_info=True)
+            logger.error(f"[{client_addr}] Erro inesperado: {e}", exc_info=False) # Mude para True para ver o traceback completo
         finally:
-            logger.info(f"[{client_addr}] Encerrando conexão.")
-            # CORREÇÃO: Fechar os sockets diretamente
-            if client_sock:
-                client_sock.close()
-            if upstream_sock:
-                upstream_sock.close()
-            # O writer de alto nível também deve ser fechado se ainda existir
+            logger.info(f"[{client_addr}] A encerrar todas as conexões.")
+            # Encerra os writers de alto nível primeiro para libertar os recursos
             if writer and not writer.is_closing():
                 writer.close()
             if upstream_writer and not upstream_writer.is_closing():
                 upstream_writer.close()
+            # Encerra os sockets de baixo nível
+            if client_sock:
+                client_sock.close()
+            if upstream_sock:
+                upstream_sock.close()
 
 
     async def transfer_low_level(self, loop: asyncio.AbstractEventLoop, r_sock: socket.socket, w_sock: socket.socket, direction: str):
@@ -126,16 +130,14 @@ class AsyncProxy:
         except (ConnectionResetError, BrokenPipeError, OSError):
             logger.warning(f"[{direction}] Conexão de transferência redefinida.")
         except Exception as e:
-            logger.error(f"[{direction}] Erro na transferência de baixo nível: {e}", exc_info=True)
+            logger.error(f"[{direction}] Erro na transferência de baixo nível: {e}", exc_info=False)
         finally:
             try:
-                # Garante que o lado de escrita seja fechado para sinalizar o fim da transmissão
+                # Notifica o outro lado que não enviaremos mais dados
                 if w_sock:
                     w_sock.shutdown(socket.SHUT_WR)
             except OSError:
-                # Ignora o erro se o socket já estiver fechado
-                pass
-
+                pass # Ignora o erro se o socket já estiver fechado
 
     async def stop(self):
         """Para o servidor"""
@@ -252,7 +254,7 @@ def run_menu(status: str) -> None:
             if ctrl.is_running(): print(f"\n  {C_YELLOW}💡 O proxy já está ativo.{C_RESET}"); time.sleep(2); continue
             port = ask_port(default_port)
             if port is None: continue
-            print(f"\n  {C_WHITE}Iniciando o proxy na porta {port}...{C_RESET}");
+            print(f"\n  {C_WHITE}A iniciar o proxy na porta {port}...{C_RESET}");
             ok = ctrl.start(port)
             if ok: print(f"  {C_GREEN}✔ Proxy iniciado com sucesso.{C_RESET}"); default_port = port; time.sleep(2.5)
             else:
@@ -261,7 +263,7 @@ def run_menu(status: str) -> None:
                 time.sleep(4)
         elif choice == "2":
             if not ctrl.is_running(): print(f"\n  {C_YELLOW}💡 O proxy já está inativo.{C_RESET}")
-            else: print(f"\n  {C_WHITE}Parando o proxy...{C_RESET}"); ctrl.stop(); print(f"  {C_GREEN}✔ Proxy interrompido.{C_RESET}")
+            else: print(f"\n  {C_WHITE}A parar o proxy...{C_RESET}"); ctrl.stop(); print(f"  {C_GREEN}✔ Proxy interrompido.{C_RESET}")
             time.sleep(2)
         elif choice == "3":
             clear_screen()
@@ -270,32 +272,32 @@ def run_menu(status: str) -> None:
                 with open(LOG_FILE, 'r') as f:
                     print(f.read())
             except FileNotFoundError:
-                print(f"{C_YELLOW}Arquivo de log ainda não foi criado.{C_RESET}")
+                print(f"{C_YELLOW}Ficheiro de log ainda não foi criado.{C_RESET}")
             print(f"\n{C_BLUE}--- Fim dos Logs ---{C_RESET}")
             input(f"\n{C_CYAN}Pressione Enter para voltar ao menu...{C_RESET}")
         elif choice == "4":
             try:
                 with open(LOG_FILE, 'w') as f:
                     f.write('')
-                logger.info("Arquivo de log limpo pelo utilizador.")
-                print(f"\n  {C_GREEN}✔ Arquivo de log ({LOG_FILE}) limpo com sucesso.{C_RESET}")
+                logger.info("Ficheiro de log limpo pelo utilizador.")
+                print(f"\n  {C_GREEN}✔ Ficheiro de log ({LOG_FILE}) limpo com sucesso.{C_RESET}")
             except Exception as e:
-                print(f"\n  {C_RED}✘ Erro ao limpar o arquivo de log: {e}{C_RESET}")
+                print(f"\n  {C_RED}✘ Erro ao limpar o ficheiro de log: {e}{C_RESET}")
             time.sleep(2)
         elif choice == "5":
             print(f"\n  {C_RED}{C_BOLD}ATENÇÃO: Ação irreversível.{C_RESET}")
             if input(f"  {C_CYAN}› Deseja realmente remover o script? (s/N): {C_RESET}").strip().lower() == 's':
-                if ctrl.is_running(): print(f"\n  {C_WHITE}Parando o proxy...{C_RESET}"); ctrl.stop(); time.sleep(1)
+                if ctrl.is_running(): print(f"\n  {C_WHITE}A parar o proxy...{C_RESET}"); ctrl.stop(); time.sleep(1)
                 try:
                     script_path = os.path.abspath(__file__);
-                    print(f"  {C_WHITE}Removendo: {script_path}{C_RESET}"); os.remove(script_path)
-                    print(f"  {C_GREEN}✔ Script removido. Saindo...{C_RESET}"); time.sleep(2); break
+                    print(f"  {C_WHITE}A remover: {script_path}{C_RESET}"); os.remove(script_path)
+                    print(f"  {C_GREEN}✔ Script removido. A sair...{C_RESET}"); time.sleep(2); break
                 except Exception as e:
                     print(f"\n  {C_RED}✘ Erro ao remover: {e}{C_RESET}"); time.sleep(4); break
             else:
                 print(f"\n  {C_YELLOW}💡 Remoção cancelada.{C_RESET}"); time.sleep(2)
         elif choice == "0":
-            if ctrl.is_running(): print(f"\n  {C_WHITE}Parando o proxy...{C_RESET}"); ctrl.stop()
+            if ctrl.is_running(): print(f"\n  {C_WHITE}A parar o proxy...{C_RESET}"); ctrl.stop()
             print(f"\n  {C_BLUE}👋 Até logo!{C_RESET}"); break
         else:
             print(f"\n  {C_RED}✘ Opção inválida.{C_RESET}"); time.sleep(1.5)
