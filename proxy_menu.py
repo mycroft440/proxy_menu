@@ -308,4 +308,3 @@ if __name__ == "__main__":
     except Exception as e:
         logger.critical(f"Erro fatal na thread principal: {e}", exc_info=True)
         print(f"\n\nOcorreu um erro fatal. Verifique {LOG_FILE} para detalhes.")
-
