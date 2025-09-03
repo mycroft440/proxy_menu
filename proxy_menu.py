@@ -20,7 +20,7 @@ from typing import Optional
 
 # ==== Configuração dos Logs ====
 LOG_FILE = "/tmp/proxy.log"
-# Previne que múltiplos handlers sejam adicionados
+# Previne que múltiplos handlers sejam adicionados se o script for importado
 if not logging.getLogger(__name__).handlers:
     logging.basicConfig(
         level=logging.DEBUG,
@@ -103,7 +103,7 @@ class AsyncProxy:
             logger.error(f"[{client_addr}] Erro inesperado: {e}", exc_info=True)
         finally:
             logger.info(f"[{client_addr}] Encerrando conexão.")
-            if not writer.is_closing():
+            if writer and not writer.is_closing():
                 writer.close()
                 await writer.wait_closed()
             if upstream_writer and not upstream_writer.is_closing():
@@ -111,25 +111,22 @@ class AsyncProxy:
                 await upstream_writer.wait_closed()
 
     async def transfer(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, direction: str):
-        """
-        CORREÇÃO: Transfere dados usando reader.read() e writer.write(),
-        a API de alto nível correta para Streams.
-        """
+        """Transfere dados usando reader.read() e writer.write()"""
         try:
             while True:
-                data = await reader.read(BUF_SIZE) # <<< USA .read()
+                data = await reader.read(BUF_SIZE)
                 if not data:
                     logger.debug(f"[{direction}] Fim do stream (EOF).")
                     break
                 logger.debug(f"[{direction}] Transferindo {len(data)} bytes.")
-                writer.write(data) # <<< USA .write()
+                writer.write(data)
                 await writer.drain()
         except (ConnectionResetError, asyncio.IncompleteReadError):
             logger.warning(f"[{direction}] Conexão de transferência redefinida.")
         except Exception as e:
             logger.error(f"[{direction}] Erro na transferência: {e}", exc_info=True)
         finally:
-            if not writer.is_closing():
+            if writer and not writer.is_closing():
                 writer.close()
 
 
@@ -308,3 +305,4 @@ if __name__ == "__main__":
     except Exception as e:
         logger.critical(f"Erro fatal na thread principal: {e}", exc_info=True)
         print(f"\n\nOcorreu um erro fatal. Verifique {LOG_FILE} para detalhes.")
+
